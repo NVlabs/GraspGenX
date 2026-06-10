@@ -1,0 +1,40 @@
+<?xml version="1.0" ?>
+<robot name="openarm_pinch_gripper">
+  <link name="world"/>
+  <joint name="world_joint" type="fixed">
+    <origin xyz="0.0 0.0 0.0"/>
+    <parent link="world"/>
+    <child link="openarm_left_ee_base_link"/>
+  </joint>
+  <link name="openarm_left_ee_base_link">
+    <visual>
+      <geometry>
+        <mesh filename="vis_mesh.obj"/>
+      </geometry>
+      <origin xyz="0.0 0.0 0.0"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="vis_mesh.obj"/>
+      </geometry>
+      <origin xyz="0.0 0.0 0.0"/>
+    </collision>
+  </link>
+  <joint name="openarm_left_finger_joint1" type="revolute">
+    <origin xyz="0.0 -0.018 0.068"/>
+    <parent link="openarm_left_ee_base_link"/>
+    <child link="openarm_left_ee_link1"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.5708" upper="0" effort="7" velocity="5"/>
+  </joint>
+  <link name="openarm_left_ee_link1"/>
+  <joint name="openarm_left_finger_joint2" type="revolute">
+    <origin xyz="0.0 0.018 0.068"/>
+    <parent link="openarm_left_ee_base_link"/>
+    <child link="openarm_left_ee_link2"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="1.5708" effort="7" velocity="5"/>
+    <mimic joint="openarm_left_finger_joint1" multiplier="-1" offset="0"/>
+  </joint>
+  <link name="openarm_left_ee_link2"/>
+</robot>

@@ -28,13 +28,11 @@ dependencies = [
     # Core PyTorch dependencies. Floor pin only — we verified the codebase
     # runs on torch 2.7 (NGC pytorch:25.03 base) as well as 2.1.0, so we
     # don't lock to a single version. Python 3.12 support requires torch
-    # >=2.2 (no cp312 wheel for 2.1.0). Cap at <2.7 because torch >=2.7
-    # only ships cu126/cu128/cu130 wheels — none are forward-compatible
-    # with the local 560.x driver. Combined with the cu124 index pin under
-    # [tool.uv.sources], this gives us a build that works on both this
-    # workstation and on the cluster.
-    "torch>=2.1,<2.7",
-    "torchvision>=0.16,<0.22",
+    # >=2.2 (no cp312 wheel for 2.1.0). No upper cap — the ROCm extra
+    # pulls 2.12+rocm7.2 which must resolve. CUDA users get PyPI wheels
+    # (currently cu128/cu130, well within the tested range).
+    "torch>=2.1",
+    "torchvision>=0.16",
 
     # PyTorch Geometric (pure-Python meta package). The CUDA companion
     # wheels (torch-scatter / torch-cluster) are no longer dependencies.
@@ -118,6 +116,15 @@ serve = [
     "msgpack",
     "msgpack-numpy",
 ]
+# AMD ROCm GPU support. Install with: uv sync --extra rocm
+# Routes torch/torchvision to the ROCm 7.2 index. Not compatible with
+# the end2end extra (nvidia-curobo, newton, warp are CUDA-only).
+rocm = [
+    "torch>=2.1",
+    "torchvision>=0.16",
+    "pytorch-triton-rocm>=3.5.1",
+    "triton-rocm>=3.6.0",
+]
 
 [tool.setuptools]
 include-package-data = true
@@ -148,10 +155,29 @@ line_length = 88
 # Allow pre-release packages (needed for pyrender -> pyglet dependencies)
 prerelease = "allow"
 
-# Auto-detect the local NVIDIA driver and pick a matching torch wheel
-# (e.g. cu126 for driver 560.x, cu130 for driver 580.x+). Avoids hardcoding
-# a CUDA build that would break for users on different driver versions.
-torch-backend = "auto"
+# Prevent mutually exclusive extras from being installed together.
+conflicts = [[{ extra = "rocm" }, { extra = "end2end" }]]
+
+# Route torch/torchvision to the ROCm index when the rocm extra is enabled.
+# Without the extra, torch resolves from PyPI (CUDA on Linux, CPU on macOS).
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+torchvision = [
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+pytorch-triton-rocm = [
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+triton-rocm = [
+    { index = "pytorch-rocm", extra = "rocm" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
 
 # Build dependencies for packages that need special build requirements
 [tool.uv.extra-build-dependencies]
