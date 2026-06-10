@@ -1,0 +1,66 @@
+{
+    "fingertip": [
+        0.0,
+        0.0,
+        0.068
+    ],
+    "open": {
+        "openarm_left_finger_joint1": 0.0,
+        "openarm_left_finger_joint2": 0.0
+    },
+    "close": {
+        "openarm_left_finger_joint1": -1.5708,
+        "openarm_left_finger_joint2": 1.5708
+    },
+    "sim": {
+        "base_joint": "openarm_left_finger_joint1",
+        "mimic_joints": {
+            "openarm_left_finger_joint2": -1
+        }
+    },
+    "sweep_volume": {
+        "extents": [
+            0.04,
+            0.04,
+            0.08
+        ],
+        "offset": [
+            0.0,
+            0.0,
+            0.09
+        ],
+        "extents2": [
+            0.03,
+            0.03,
+            0.06
+        ],
+        "offset2": [
+            0.0,
+            0.0,
+            0.08
+        ]
+    },
+    "standoff": [
+        0.0,
+        0.04
+    ],
+    "links": [
+        "openarm_left_ee_base_link",
+        "openarm_left_ee_link1",
+        "openarm_left_ee_link2"
+    ],
+    "symmetric": true,
+    "type": "revolute_2f",
+    "bbox": [
+        [
+            -0.02,
+            -0.03,
+            0.0
+        ],
+        [
+            0.05,
+            0.03,
+            0.12
+        ]
+    ]
+}
