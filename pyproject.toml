@@ -25,16 +25,12 @@ classifiers = [
 ]
 
 dependencies = [
-    # Core PyTorch dependencies. Floor pin only — we verified the codebase
-    # runs on torch 2.7 (NGC pytorch:25.03 base) as well as 2.1.0, so we
-    # don't lock to a single version. Python 3.12 support requires torch
-    # >=2.2 (no cp312 wheel for 2.1.0). Cap at <2.7 because torch >=2.7
-    # only ships cu126/cu128/cu130 wheels — none are forward-compatible
-    # with the local 560.x driver. Combined with the cu124 index pin under
-    # [tool.uv.sources], this gives us a build that works on both this
-    # workstation and on the cluster.
-    "torch>=2.1,<2.7",
-    "torchvision>=0.16,<0.22",
+    # Core PyTorch dependencies. Floor pin only — torch is heavily
+    # version-flexible (verified on 2.1.0, 2.7, 2.12). The upper cap was
+    # originally <2.7 for driver compatibility; on DGX Spark (aarch64,
+    # driver 580.95, CUDA 13.0) torch >=2.12 is needed.
+    "torch>=2.1",
+    "torchvision>=0.16",
 
     # PyTorch Geometric (pure-Python meta package). The CUDA companion
     # wheels (torch-scatter / torch-cluster) are no longer dependencies.
@@ -68,7 +64,7 @@ dependencies = [
 
     # Additional dependencies
     "pyrender",
-    "scene-synthesizer[recommend]",
+    "scene-synthesizer[recommend]; platform_machine != 'aarch64'",
     "imageio",
     "viser",
     "tqdm",
@@ -78,6 +74,9 @@ dependencies = [
     # Pin setuptools to a version that still includes pkg_resources
     # (required by torch.cpp_extension for building CUDA extensions like
     # pointnet2_ops on older torch versions).
+    # NOTE: pointnet2_ops has no prebuilt aarch64 wheel; on DGX Spark
+    # (aarch64) it falls back to JIT compilation which may fail. Use the
+    # ptv3vanilla backbone instead (default in inference tests).
     "setuptools>=45,<78",
 
     # NOTE: the end-to-end pick-and-place pipeline (end2end/) needs a heavier
