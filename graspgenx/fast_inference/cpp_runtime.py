@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,12 +89,33 @@ def resolve_artifact_directory(
         diffusion_grasps=diffusion_grasps,
         obb_grasps=obb_grasps,
     )
-    missing = [str(path) for path in required if not path.is_file()]
+    missing = [path for path in required if not path.is_file()]
     if missing:
+        requested = (int(diffusion_grasps), int(obb_grasps))
+        available = _available_runtime_domains(directory, int(diffusion_steps))
+        available_text = (
+            ", ".join(
+                f"{diffusion} diffusion + {obb} OBB" for diffusion, obb in available
+            )
+            if available
+            else "none"
+        )
+        issue = (
+            "artifact domain mismatch"
+            if available and requested not in available
+            else "artifacts are incomplete"
+        )
         raise FileNotFoundError(
-            "Native GraspGenX artifacts are missing. Run "
-            "`graspgenx-install-fast-inference` or set "
-            f"{_ARTIFACT_ENV}. Missing: {missing}"
+            f"Native GraspGenX {issue}. Requested domain: "
+            f"{int(diffusion_steps)} DDPM steps, {requested[0]} diffusion + "
+            f"{requested[1]} OBB grasps ({sum(requested)} total candidates). "
+            f"Available complete domains for {int(diffusion_steps)} DDPM steps: "
+            f"{available_text}. Build the requested domain with "
+            "`uv run --quiet --extra fast-inference graspgenx-install-fast-inference "
+            f"--diffusion-steps {int(diffusion_steps)} "
+            f"--diffusion-grasps {requested[0]} --obb-grasps {requested[1]}`. "
+            f"Artifact directory: {directory}. Missing: "
+            f"{[str(path) for path in missing]}"
         )
     return directory
 
@@ -128,6 +150,33 @@ def required_runtime_artifacts(
         schedule / "timestep_conditioning.bin",
         schedule / "ddpm_coefficients.bin",
     )
+
+
+_ARTIFACT_REPORT_PATTERN = re.compile(
+    r"^(?:build|export)_report_d(?P<diffusion>\d+)_o(?P<obb>\d+)\.json$"
+)
+
+
+def _available_runtime_domains(
+    directory: Path, diffusion_steps: int
+) -> tuple[tuple[int, int], ...]:
+    """Return complete fixed-count domains described by artifact reports."""
+    domains = set()
+    for report_directory in (directory / "engines", directory / "onnx"):
+        for report in report_directory.glob("*_report_d*_o*.json"):
+            match = _ARTIFACT_REPORT_PATTERN.match(report.name)
+            if match is None:
+                continue
+            domain = (int(match["diffusion"]), int(match["obb"]))
+            required = required_runtime_artifacts(
+                directory,
+                diffusion_steps=diffusion_steps,
+                diffusion_grasps=domain[0],
+                obb_grasps=domain[1],
+            )
+            if all(path.is_file() for path in required):
+                domains.add(domain)
+    return tuple(sorted(domains))
 
 
 def _configure_library(library):

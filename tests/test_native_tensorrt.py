@@ -22,6 +22,7 @@ from graspgenx.fast_inference import DEFAULT_DDPM_INFERENCE_STEPS
 from graspgenx.fast_inference.cpp_runtime import (
     NativeCppRuntime,
     NativeGripperEmbeddings,
+    required_runtime_artifacts,
     resolve_artifact_directory,
 )
 from graspgenx.grasp_server import GraspGenXSampler
@@ -69,6 +70,35 @@ def test_normal_sobol_artifacts_are_finite_nested_prefixes():
 def test_cpp_artifact_resolver_reports_count_specific_missing_files(tmp_path):
     with pytest.raises(FileNotFoundError, match="denoiser_core_d17_fp16.plan"):
         resolve_artifact_directory(tmp_path, diffusion_grasps=17, obb_grasps=7)
+
+
+def test_cpp_artifact_resolver_explains_fixed_domain_mismatch(tmp_path):
+    for path in required_runtime_artifacts(
+        tmp_path,
+        diffusion_steps=20,
+        diffusion_grasps=100,
+        obb_grasps=50,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    (tmp_path / "engines/build_report_d100_o50.json").write_text("{}")
+
+    with pytest.raises(FileNotFoundError) as error:
+        resolve_artifact_directory(
+            tmp_path,
+            diffusion_steps=20,
+            diffusion_grasps=200,
+            obb_grasps=50,
+        )
+
+    message = str(error.value)
+    assert "artifact domain mismatch" in message
+    assert "200 diffusion + 50 OBB grasps (250 total candidates)" in message
+    assert (
+        "Available complete domains for 20 DDPM steps: 100 diffusion + 50 OBB"
+        in message
+    )
+    assert "--diffusion-grasps 200 --obb-grasps 50" in message
 
 
 def test_failed_cpp_install_does_not_publish_partial_runtime(monkeypatch):

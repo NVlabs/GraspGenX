@@ -20,7 +20,9 @@ the eager model untouched. From a source checkout, install the complete native
 path with:
 
 ```bash
-uv run --extra fast-inference graspgenx-install-fast-inference
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
+    --diffusion-grasps 200 \
+    --obb-grasps 50
 ```
 
 The installer puts the library and artifacts in locations that the package

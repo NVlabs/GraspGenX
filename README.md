@@ -92,24 +92,43 @@ uv sync
 Fast inference is a separate native C++ runtime. Build it on the target GPU:
 
 ```bash
-uv run --extra fast-inference graspgenx-install-fast-inference
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
+    --diffusion-grasps 200 \
+    --obb-grasps 50
 ```
 
-This one command installs the Python build dependencies, downloads the released
-checkpoints when needed, exports GPU-specific TensorRT plans, builds the C++
-runtime into the package search path, and runs an end-to-end smoke test. It
-reuses complete plans and incremental CMake output on subsequent runs.
+To install fast inference together with the Viser and rendering dependencies:
+
+```bash
+uv sync --quiet --extra fast-inference --extra visualization
+uv run --quiet --extra fast-inference --extra visualization graspgenx-install-fast-inference \
+    --diffusion-grasps 200 \
+    --obb-grasps 50
+```
+
+The installer command installs the Python build dependencies, downloads the
+released checkpoints when needed, exports GPU-specific TensorRT plans, builds
+the C++ runtime into the package search path, and runs an end-to-end smoke test.
+It reuses complete plans and incremental CMake output on subsequent runs. The
+installer shows only phase summaries by default and prints captured tool output
+if a command fails. Add `--verbose` to stream ONNX, TensorRT, and CMake output.
+
+TensorRT plan generation uses builder optimization level 2 by default for a
+reasonable install time. Add `--tensorrt-optimization-level 3` or
+`--tensorrt-optimization-level 5` to spend more build time searching for faster
+plans. Add `--force-artifacts` as well when rebuilding existing plans.
 
 The host still needs a CUDA toolkit with `nvcc` and matching TensorRT runtime
 and development headers (`libnvinfer` and `NvInfer.h`). For a nonstandard CUDA
 or TensorRT installation, pass `--cuda-root` or `--tensorrt-root`.
 
 Inside an existing conda or Python environment, use `pip install -e .` for
-PyTorch inference. Use `pip install -e ".[fast-inference]"` followed by
-`graspgenx-install-fast-inference` for the native runtime.
+PyTorch inference. Use the uv commands above for the complete native runtime;
+they select the CUDA 13 PyTorch and TensorRT packages together.
 
-Add `--extra visualization` only when running the Viser or rendering demos, and
-`--extra training` only for dataset and training utilities.
+Add `--extra visualization` only when running the Viser or rendering demos,
+`--extra usd` only for USD loading/export on supported platforms, and `--extra
+training` only for dataset and training utilities.
 
 See [Fast inference](FAST_INFERENCE.md) for the optimized pipeline and the
 [native C++ TensorRT runtime](cpp_runtime/README.md) for build and API details.

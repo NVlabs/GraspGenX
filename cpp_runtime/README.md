@@ -54,7 +54,8 @@ runtime and development files (`libnvinfer` and `NvInfer.h`). Everything else
 is driven by one command from the repository root:
 
 ```bash
-uv run --extra fast-inference graspgenx-install-fast-inference
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
+  --diffusion-grasps 200 --obb-grasps 50
 ```
 
 The installer:
@@ -66,19 +67,25 @@ The installer:
    `graspgenx/fast_inference/lib/`, where Python discovers it automatically; and
 5. runs a Python-device-pointer to C++ CUDA Graph smoke test.
 
-Complete artifacts are reused. Common variants remain one command:
+Child-process logs stay hidden unless a command fails; pass `--verbose` to
+stream ONNX, TensorRT, and CMake output. Complete artifacts are reused. Common
+variants remain one command:
 
 ```bash
 # A different fixed candidate shape.
-uv run --extra fast-inference graspgenx-install-fast-inference \
-  --diffusion-grasps 200 --obb-grasps 75
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
+  --diffusion-grasps 500 --obb-grasps 50
 
 # Nonstandard toolkit locations.
-uv run --extra fast-inference graspgenx-install-fast-inference \
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
   --cuda-root /opt/cuda-13.0 --tensorrt-root /opt/tensorrt
 
 # Rebuild plans after a checkpoint, TensorRT, or GPU change.
-uv run --extra fast-inference graspgenx-install-fast-inference --force-artifacts
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference --force-artifacts
+
+# Spend more build time searching for faster TensorRT plans (level 2 is default).
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
+  --tensorrt-optimization-level 5 --force-artifacts
 ```
 
 Use `--dry-run` to inspect the underlying commands. `--skip-artifacts` and

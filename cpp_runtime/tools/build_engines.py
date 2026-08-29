@@ -21,9 +21,10 @@ GRAPH_PRECISIONS = {
 }
 WORKSPACE_BYTES = 8 * (1024**3)
 TIMING_ITERATIONS = 8
+DEFAULT_OPTIMIZATION_LEVEL = 2
 
 
-def parse_args():
+def parse_args(argv=None):
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -38,10 +39,23 @@ def parse_args():
     )
     parser.add_argument("--diffusion-grasps", type=int, default=100)
     parser.add_argument("--obb-grasps", type=int, default=50)
-    return parser.parse_args()
+    parser.add_argument(
+        "--optimization-level",
+        type=int,
+        choices=range(6),
+        default=DEFAULT_OPTIMIZATION_LEVEL,
+    )
+    return parser.parse_args(argv)
 
 
-def build_engine(onnx_path, plan_path, precision, workspace_bytes, timing_iterations):
+def build_engine(
+    onnx_path,
+    plan_path,
+    precision,
+    workspace_bytes,
+    timing_iterations,
+    optimization_level,
+):
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
     explicit_batch = getattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH", None)
@@ -58,7 +72,7 @@ def build_engine(onnx_path, plan_path, precision, workspace_bytes, timing_iterat
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
-    config.builder_optimization_level = 5
+    config.builder_optimization_level = optimization_level
     config.avg_timing_iterations = timing_iterations
     config.max_aux_streams = 0
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
@@ -99,6 +113,7 @@ def main():
         "tensorrt": trt.__version__,
         "workspace_bytes": WORKSPACE_BYTES,
         "timing_iterations": TIMING_ITERATIONS,
+        "builder_optimization_level": args.optimization_level,
         "engines": {},
     }
     ptv3_graphs = [
@@ -132,6 +147,7 @@ def main():
             precision,
             WORKSPACE_BYTES,
             TIMING_ITERATIONS,
+            args.optimization_level,
         )
     report_path = args.output_dir / (
         f"build_report_d{args.diffusion_grasps}_o{args.obb_grasps}.json"

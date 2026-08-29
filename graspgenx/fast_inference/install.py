@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from graspgenx._setup_dependencies import get_checkpoints_version_dir
@@ -71,6 +72,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--diffusion-grasps", type=int, default=100)
     parser.add_argument("--obb-grasps", type=int, default=50)
+    parser.add_argument(
+        "--tensorrt-optimization-level",
+        type=int,
+        choices=range(6),
+        default=2,
+        help="TensorRT builder optimization level (default: 2; use 3 or 5 for longer builds)",
+    )
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument(
         "--force-artifacts",
@@ -89,6 +97,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="stream commands and child-process output instead of hiding it",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="print commands without running them"
     )
     args = parser.parse_args(argv)
@@ -105,10 +118,30 @@ def parse_args(argv=None):
     return args
 
 
-def _run(command: list[str], *, dry_run: bool):
-    print(f"+ {shlex.join(command)}", flush=True)
-    if not dry_run:
+def _run(command: list[str], *, dry_run: bool, verbose: bool = False):
+    if dry_run or verbose:
+        print(f"+ {shlex.join(command)}", flush=True)
+    if dry_run:
+        return
+    if verbose:
         subprocess.run(command, cwd=_ROOT, check=True)
+        return
+
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
+        completed = subprocess.run(
+            command,
+            cwd=_ROOT,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if completed.returncode != 0:
+            output.seek(0)
+            print(f"Command failed: {shlex.join(command)}", file=sys.stderr)
+            diagnostics = output.read()
+            if diagnostics:
+                print(diagnostics, file=sys.stderr, end="")
+            completed.check_returncode()
 
 
 def _artifact_commands(args) -> list[list[str]]:
@@ -157,6 +190,8 @@ def _artifact_commands(args) -> list[list[str]]:
             "--output-dir",
             str(artifacts / "engines"),
             *counts,
+            "--optimization-level",
+            str(args.tensorrt_optimization_level),
         ],
     ]
 
@@ -301,7 +336,7 @@ def main(argv=None):
             _import_build_dependencies()
         print("Generating GPU-specific native runtime artifacts...", flush=True)
         for command in _artifact_commands(args):
-            _run(command, dry_run=args.dry_run)
+            _run(command, dry_run=args.dry_run, verbose=args.verbose)
     else:
         print(f"Reusing complete artifacts: {args.artifact_directory}", flush=True)
 
@@ -320,7 +355,7 @@ def main(argv=None):
         args.library_directory.mkdir(parents=True, exist_ok=True)
         print("Building the native C++ runtime...", flush=True)
         for command in _cmake_commands(args, cmake):
-            _run(command, dry_run=args.dry_run)
+            _run(command, dry_run=args.dry_run, verbose=args.verbose)
 
     if args.dry_run:
         print("Dry run complete.")
