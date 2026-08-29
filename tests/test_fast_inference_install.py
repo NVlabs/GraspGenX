@@ -33,8 +33,21 @@ def test_fast_inference_selects_cuda13_dependencies():
     assert 'url = "https://download.pytorch.org/whl/cu130"' in pyproject
     assert '"torch>=2.9"' in pyproject
     assert '{ index = "pytorch-cu130", extra = "fast-inference" }' in pyproject
-    assert '"tensorrt-cu13-bindings==10.13.3.9"' in pyproject
-    assert '"tensorrt-cu13-libs==10.13.3.9"' in pyproject
+    assert (
+        "\"tensorrt-cu13-bindings==10.13.3.9; platform_machine != 'aarch64'\""
+        in pyproject
+    )
+    assert (
+        "\"tensorrt-cu13-libs==10.13.3.9; platform_machine != 'aarch64'\"" in pyproject
+    )
+    assert (
+        "\"tensorrt-cu13-bindings>=10.16,<10.17; platform_machine == 'aarch64'\""
+        in pyproject
+    )
+    assert (
+        "\"tensorrt-cu13-libs>=10.16,<10.17; platform_machine == 'aarch64'\""
+        in pyproject
+    )
     assert '"nvidia-cuda-runtime-cu13"' in pyproject
     assert '"torchvision>=0.16"' in pyproject
 
@@ -46,7 +59,8 @@ def test_visualization_keeps_usd_in_a_separate_extra():
     extras = pyproject["project"]["optional-dependencies"]
 
     assert "usd-core" not in extras["visualization"]
-    assert extras["usd"] == ["usd-core"]
+    assert "scene-synthesizer" not in extras["visualization"]
+    assert extras["usd"] == ["scene-synthesizer", "usd-core"]
 
 
 def _touch_artifacts(directory: Path, steps=20, diffusion=100, obb=50):
