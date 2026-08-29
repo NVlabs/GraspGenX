@@ -10,7 +10,7 @@ scoring instead of re-encoding per object.
 import pytest
 import torch
 
-from graspgenx.dataset.dataset import collate
+from graspgenx.batching import collate
 from graspgenx.models.discriminator import GraspGenDiscriminator
 
 import sys

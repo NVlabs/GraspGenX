@@ -42,6 +42,9 @@ uv pip install pyzmq msgpack msgpack-numpy
 uv sync --extra serve
 ```
 
+Add `--extra fast-inference` to the `uv sync` command when the server should use
+the native C++ runtime.
+
 The client-side machine only needs `pyzmq`, `msgpack`, `msgpack-numpy`, `numpy`, and `trimesh` — no PyTorch or CUDA.
 
 ## Start the server
@@ -99,7 +102,7 @@ with GraspGenXClient(host="localhost", port=5556) as client:
     #     "generator_backbone": "ptv3vanilla",
     #     "discriminator_backbone": "ptv3vanilla",
     #     "grasp_repr": "r3_so3",
-    #     "num_diffusion_iters_eval": 20,
+    #     "num_diffusion_iters_eval": 10,
     #   },
     #   "assets_dir": "/.../graspgenx/assets",
     # }
@@ -108,7 +111,7 @@ with GraspGenXClient(host="localhost", port=5556) as client:
     grasps, confidences = client.infer(
         point_cloud,                  # (N, 3) numpy float32
         gripper_name="franka_panda",  # gripper whose sweep volume v2 conditions the model
-        num_grasps=200,               # diffusion samples
+        num_grasps=100,               # diffusion samples
         grasp_threshold=-1.0,         # -1.0 ⇒ use top-k instead of threshold
         topk_num_grasps=100,          # return top-k by confidence
     )
@@ -126,7 +129,7 @@ axis-aligned boxes in the gripper base frame (+Z = approach, +X = closing
 direction) enclosing the inner finger volume at the open and half-open
 states. Three actions accept those 12 numbers directly instead of a gripper
 name, so the server needs **no assets** for the gripper — including grippers
-it has never seen:
+outside its training set:
 
 ```python
 from graspgenx.serving import GraspGenXClient, SweepVolumeParams
@@ -181,9 +184,12 @@ Notes:
   `grasp_threshold` / `topk_num_grasps` arguments of the Python client are
   applied **client-side**; raw-wire callers must threshold themselves (the
   server rejects those fields on the new actions).
-- The server runs eager PyTorch **fp32** by default. TensorRT is opt-in via
-  `graspgenx_server.py --tensorrt [--tensorrt_precision fp16]`; the
-  `metadata` response reports the active precision under `"precision"`.
+- The server runs eager PyTorch **fp32** by default. The native C++ runtime is
+  enabled with `graspgenx_server.py --fast-inference`; it runs
+  the default released 20-step DDPM trajectory as one CUDA Graph and
+  installs the combined dual-PTV3 CUDA runtime plus the native TensorRT scorer.
+  PointNet2 and Torch-TensorRT are not required.
+  The `metadata` response reports the active precision under `"precision"`.
 - Instances with fewer than `min_object_points` (default 100) valid points,
   or with no grasps found, are absent from the returned dict.
 - Collision filtering against the rest of the scene is **not** applied
@@ -197,9 +203,10 @@ server on the shipped sample scenes and render the results in a
 grouped per object under `obj/<label>/grasps/{diff,obb}_*` in the scene tree).
 
 ```bash
-# Terminal 1 — start the server once (fp32, no TensorRT by default):
+# Terminal 1 — start the server with the native C++ fast runtime:
 uv run python client-server/graspgenx_server.py \
-    --config ext/graspgenx_checkpoints/release --assets_dir assets --port 5556
+    --config ext/graspgenx_checkpoints/release --assets_dir assets --port 5556 \
+    --fast-inference
 
 # Terminal 2 — run a mode, then open the URL the script prints:
 
@@ -241,7 +248,7 @@ Wire format: **msgpack** (with `msgpack_numpy.patch()` so numpy arrays travel na
 |---------|--------|----------|
 | `{"action": "health"}` | — | `{"status": "ok"}` |
 | `{"action": "metadata"}` | — | `{"default_gripper": str?, "loaded_grippers": [str], "model": {...}, "assets_dir": str}` |
-| `{"action": "infer", ...}` | `point_cloud` (N,3 float32), `gripper_name` (str, optional if server has a default), `num_grasps` (int=200), `grasp_threshold` (float=-1.0), `topk_num_grasps` (int=100) | `{"grasps": (K,4,4) float32, "confidences": (K,) float32, "gripper_name": str, "timing": {"infer_ms": float}}` |
+| `{"action": "infer", ...}` | `point_cloud` (N,3 float32), `gripper_name` (str, optional if server has a default), `num_grasps` (int=100), `grasp_threshold` (float=-1.0), `topk_num_grasps` (int=100) | `{"grasps": (K,4,4) float32, "confidences": (K,) float32, "gripper_name": str, "timing": {"infer_ms": float}}` |
 | `{"action": "infer_object", ...}` | `point_cloud` (N,3 float32), `sweep_volume_params` (map or flat (12,) float32 — required, no gripper_name), `planner` ("graspmoe"\|"diffusion"), `num_grasps`, `moe_*` knobs | `{"grasps": (K,4,4), "confidences": (K,), "branch_tags": ["diff"\|"obb", ...], "timing": {...}}` — frame of the input PC; **ALL** generated grasps (`grasp_threshold`/`topk_num_grasps` are rejected — threshold client-side) |
 | `{"action": "infer_scene_depth", ...}` | `depth` (H,W float32 **meters**), `intrinsics` (3,3), `instance_mask` (H,W int, 0 = ignore), `sweep_volume_params`, `min_object_points` (int=100), planner + sampling knobs | `{"instance_ids": (M,) int32, "grasps": [(Ki,4,4)], "confidences": [(Ki,)], "branch_tags": [[str]], "skipped_instance_ids": (S,) int32, "timing": {...}}` — **camera frame**; parallel lists, aligned with `instance_ids` |
 | `{"action": "infer_scene_pc", ...}` | `point_cloud` ((N,3) or (H,W,3) float32), `instance_mask` (int array with N elements), `sweep_volume_params`, `min_object_points`, planner + sampling knobs | same shape as `infer_scene_depth`, grasps in the input PC's frame |

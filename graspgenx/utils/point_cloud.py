@@ -16,7 +16,6 @@ from graspgenx.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
-# @torch.compile
 def knn_points(X: torch.Tensor, K: int, norm: int):
     """
     Computes the K-nearest neighbors for each point in the point cloud X.
@@ -74,6 +73,27 @@ def point_cloud_outlier_removal(
         f"Removed {obj_pc.shape[1] - filtered_pc.shape[0]} points from point cloud"
     )
     return filtered_pc, removed_pc
+
+
+def resample_point_cloud_fixed(
+    obj_pc: torch.Tensor, num_points: int = 3500
+) -> torch.Tensor:
+    """Deterministically select or repeat rows to a fixed point count."""
+    if obj_pc.ndim != 2 or obj_pc.shape[1] != 3:
+        raise ValueError(f"expected point cloud [N,3], got {tuple(obj_pc.shape)}")
+    if len(obj_pc) == 0:
+        raise ValueError("cannot resample an empty point cloud")
+    if num_points <= 0:
+        raise ValueError("num_points must be positive")
+    count = len(obj_pc)
+    output_indices = torch.arange(num_points, device=obj_pc.device)
+    if count >= num_points:
+        input_indices = torch.div(
+            output_indices * count, num_points, rounding_mode="floor"
+        )
+    else:
+        input_indices = output_indices.remainder(count)
+    return obj_pc[input_indices]
 
 
 def depth2points(

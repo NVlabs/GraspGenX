@@ -2,22 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import sys
-
 import time
+
 import numpy as np
 import omegaconf
 import torch
 
-from graspgenx.dataset.dataset import collate
+from graspgenx.batching import collate
+from graspgenx.inference.preprocessing import (
+    MIN_OBJECT_POINT_COUNT,
+    filter_and_resample_point_cloud,
+)
 from graspgenx.models.grasp_gen import GraspGen
-from graspgenx.utils.point_cloud import knn_points, point_cloud_outlier_removal
+from graspgenx.utils.logging_config import get_logger
+from graspgenx.utils.point_cloud import resample_point_cloud_fixed
 from graspgenx.x_grippers import (
     XGripperInfo,
     make_sweep_volume_gripper_info,
     resolve_gripper_info,
 )
-from graspgenx.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
@@ -52,10 +55,11 @@ class GraspGenXSampler:
     def __init__(
         self,
         cfg: omegaconf.DictConfig,
-        gripper_name: str = None,
-        assets_dir: str = None,
-        use_tensorrt: bool = False,
-        tensorrt_precision: str = "fp32",
+        gripper_name: str | None = None,
+        assets_dir: str | None = None,
+        use_fast_inference: bool = False,
+        diffusion_grasps: int = 100,
+        obb_grasps: int = 50,
         gripper_info: XGripperInfo = None,
         model=None,
     ):
@@ -66,10 +70,11 @@ class GraspGenXSampler:
                           exclusive with gripper_info.
             assets_dir: Root directory containing x_grippers/ and proc_grippers/
                         subdirectories. Defaults to /code/assets (docker path).
-            use_tensorrt: If True, compile the diffusion denoiser to TensorRT
-                          (opt-in; requires the 'tensorrt' extra). Falls back to
-                          eager PyTorch if unavailable or compilation fails.
-            tensorrt_precision: 'fp32' (default, exact parity) or 'fp16'.
+            use_fast_inference: If True, delegate the complete optimized pipeline
+                                to the native C++ runtime.
+            diffusion_grasps: Fixed diffusion candidate count for fast
+                              inference.
+            obb_grasps: Fixed analytic candidate count for optimized inference.
             gripper_info: Pre-built XGripperInfo (e.g. from raw sweep-volume
                           params) used instead of a name-based asset lookup.
             model: Already-loaded GraspGen model to reuse. The model is
@@ -96,21 +101,74 @@ class GraspGenXSampler:
             model = load_grasp_gen_model(cfg)
 
         self.model = model
+        self.diffusion_grasps = int(diffusion_grasps)
+        self.obb_grasps = int(obb_grasps)
+        self._gripper_input_cache = {}
+        self.using_fast_inference = False
+        self.native_runtime = getattr(model, "native_cpp_runtime", None)
+        self._native_gripper = None
 
-        if use_tensorrt:
-            from graspgenx.models.tensorrt_utils import accelerate_sampler
-            from graspgenx.samplers.graspmoe import set_gpu_obb
+        if use_fast_inference and self.native_runtime is None:
+            from graspgenx.fast_inference import install_fast_runtime
 
-            accelerated = accelerate_sampler(self, precision=tensorrt_precision)
+            accelerated = install_fast_runtime(
+                self,
+                diffusion_grasps=self.diffusion_grasps,
+                obb_grasps=self.obb_grasps,
+            )
             if accelerated:
-                logger.info("Diffusion denoiser accelerated with TensorRT.")
+                logger.info("Inference delegated to the native C++ runtime.")
             else:
-                logger.warning(
-                    "TensorRT acceleration not applied; using eager PyTorch."
+                logger.warning("Fast inference not enabled; using eager PyTorch.")
+            self.native_runtime = getattr(model, "native_cpp_runtime", None)
+        self.using_fast_inference = self.native_runtime is not None
+        if self.using_fast_inference:
+            if (
+                self.diffusion_grasps != self.native_runtime.diffusion_grasps
+                or self.obb_grasps != self.native_runtime.obb_grasps
+            ):
+                raise ValueError(
+                    "sampler candidate counts do not match the shared native runtime"
                 )
-            # Run the GraspMoE OBB outlier-removal on GPU only when TensorRT is
-            # requested; otherwise it stays on the CPU (scipy).
-            set_gpu_obb(True)
+            self._native_gripper = self._prepare_native_gripper()
+
+    def _prepare_native_gripper(self):
+        from graspgenx.fast_inference.cpp_runtime import encode_gripper_embeddings
+
+        descriptor = np.concatenate(
+            (self.gripper.sweep_volume, self.gripper.sweep_volume_mid), axis=0
+        )
+        return encode_gripper_embeddings(
+            self.model, descriptor, float(self.gripper.depth)
+        )
+
+    def _native_result(self, object_pc, num_grasps: int):
+        if int(num_grasps) != self.native_runtime.diffusion_grasps:
+            raise ValueError(
+                "native C++ inference uses the construction-time diffusion count "
+                f"{self.native_runtime.diffusion_grasps}; received {num_grasps}"
+            )
+        if isinstance(object_pc, np.ndarray):
+            points = torch.from_numpy(np.asarray(object_pc, dtype=np.float32))
+        else:
+            points = object_pc
+        result = self.native_runtime.infer(points, self._native_gripper)
+        if bool(result.ptv3_topology_overflow.any().item()):
+            raise RuntimeError(
+                "native PTV3 topology capacity overflow; inference result is invalid"
+            )
+        return result
+
+    def _sample_native(self, object_pc, threshold: float, num_grasps: int):
+        result = self._native_result(object_pc, num_grasps)
+        branch = result.source_indices < self.native_runtime.diffusion_grasps
+        grasps = result.grasps[branch]
+        confidence = result.confidence[branch]
+        if threshold > 0.0:
+            keep = confidence >= threshold
+            grasps = grasps[keep]
+            confidence = confidence[keep]
+        return grasps, confidence
 
     @classmethod
     def from_sweep_volume(
@@ -118,8 +176,9 @@ class GraspGenXSampler:
         cfg: omegaconf.DictConfig,
         params,
         model=None,
-        use_tensorrt: bool = False,
-        tensorrt_precision: str = "fp32",
+        use_fast_inference: bool = False,
+        diffusion_grasps: int = 100,
+        obb_grasps: int = 50,
     ) -> "GraspGenXSampler":
         """Build a sampler from raw sweep-volume parameters — no gripper assets.
 
@@ -163,8 +222,9 @@ class GraspGenXSampler:
             cfg,
             gripper_info=gripper_info,
             model=model,
-            use_tensorrt=use_tensorrt,
-            tensorrt_precision=tensorrt_precision,
+            use_fast_inference=use_fast_inference,
+            diffusion_grasps=diffusion_grasps,
+            obb_grasps=obb_grasps,
         )
 
     @staticmethod
@@ -172,7 +232,7 @@ class GraspGenXSampler:
         object_pc: np.ndarray | torch.Tensor,
         grasp_sampler: "GraspGenXSampler",
         grasp_threshold: float = -1.0,
-        num_grasps: int = 200,
+        num_grasps: int | None = None,
         topk_num_grasps: int = -1,
         min_grasps: int = 40,
         max_tries: int = 6,
@@ -193,6 +253,8 @@ class GraspGenXSampler:
             grasps: Generated grasp poses
             grasp_conf: Confidence scores for the grasps
         """
+        if num_grasps is None:
+            num_grasps = grasp_sampler.diffusion_grasps
         if type(object_pc) == np.ndarray:
             object_pc = torch.from_numpy(object_pc).cuda().float()
 
@@ -217,13 +279,11 @@ class GraspGenXSampler:
 
             # Sort and prune grasps within this iteration
             if topk_num_grasps != -1 and len(grasps) > 0:
-                grasp_conf, grasps = zip(
-                    *sorted(zip(grasp_conf, grasps), key=lambda x: x[0], reverse=True)
+                keep_count = min(topk_num_grasps, len(grasps))
+                grasp_conf, order = torch.topk(
+                    grasp_conf, keep_count, largest=True, sorted=True
                 )
-                grasps = torch.stack(grasps)
-                grasp_conf = torch.stack(grasp_conf)
-                grasps = grasps[:topk_num_grasps]
-                grasp_conf = grasp_conf[:topk_num_grasps]
+                grasps = grasps[order]
 
             all_grasps.append(grasps)
             all_conf.append(grasp_conf)
@@ -253,15 +313,15 @@ class GraspGenXSampler:
         object_pcs: list,
         grasp_sampler: "GraspGenXSampler",
         grasp_threshold: float = -1.0,
-        num_grasps: int = 200,
+        num_grasps: int | None = None,
         topk_num_grasps: int = -1,
         remove_outliers: bool = True,
         return_object_embedding: bool = False,
     ) -> list:
-        """Batched run_inference: one diffusion + discriminator forward pass
-        over N object PCs. Equivalent to ``[run_inference(pc, ...) for pc in
-        object_pcs]`` but folds the reverse-diffusion loop into a single
-        batched call.
+        """Run one batched eager-PyTorch inference call over N object PCs.
+
+        The native C++ runtime is intentionally fixed to one object and rejects
+        ``N > 1``; call this method once per object there.
 
         Each input PC is resampled (with replacement) to
         ``grasp_sampler.cfg.data.num_points`` so that ``collate`` can stack
@@ -289,8 +349,31 @@ class GraspGenXSampler:
         """
         if len(object_pcs) == 0:
             return []
+        if grasp_sampler.using_fast_inference and len(object_pcs) > 1:
+            raise ValueError(
+                "The native C++ runtime supports exactly one "
+                "object per call; loop over objects for batch size > 1."
+            )
+        if num_grasps is None:
+            num_grasps = grasp_sampler.diffusion_grasps
         if grasp_threshold == -1.0 and topk_num_grasps == -1:
             topk_num_grasps = 100
+
+        if grasp_sampler.using_fast_inference:
+            if return_object_embedding:
+                raise ValueError(
+                    "the native C++ fast path returns final ranked grasps, not "
+                    "framework object embeddings"
+                )
+            grasps, confidence = grasp_sampler._sample_native(
+                object_pcs[0], grasp_threshold, int(num_grasps)
+            )
+            if topk_num_grasps != -1 and len(grasps) > topk_num_grasps:
+                confidence, order = torch.topk(
+                    confidence, topk_num_grasps, largest=True, sorted=True
+                )
+                grasps = grasps[order]
+            return [(grasps, confidence)]
 
         device = next(grasp_sampler.model.parameters()).device
         target_n = int(grasp_sampler.cfg.data.num_points)
@@ -302,28 +385,22 @@ class GraspGenXSampler:
                 pc_t = torch.from_numpy(pc).float()
             else:
                 pc_t = pc.float()
-            if remove_outliers:
-                pc_f, _ = point_cloud_outlier_removal(pc_t)
-                if len(pc_f) >= 10:
-                    pc_t = pc_f
-                else:
-                    logger.warning(
-                        "Outlier removal left %d/%d points; using the "
-                        "unfiltered point cloud.",
-                        len(pc_f),
-                        len(pc_t),
-                    )
-            if len(pc_t) == 0:
+            if len(pc_t) < MIN_OBJECT_POINT_COUNT:
                 raise ValueError(
-                    "run_inference_batch received an empty point cloud."
+                    "run_inference_batch requires at least "
+                    f"{MIN_OBJECT_POINT_COUNT} object points; received {len(pc_t)}"
                 )
-            # Resample with replacement to the training-time budget so all
-            # batch items have the same shape (collate uses torch.stack).
-            n = pc_t.shape[0]
-            if n != target_n:
-                idx = torch.randint(0, n, (target_n,))
-                pc_t = pc_t[idx]
             pc_t = pc_t.to(device)
+            if remove_outliers:
+                # Scene segmentations may contain tens of thousands of pixels.
+                # PTV3 consumes exactly target_n points, so deterministically
+                # reduce oversized inputs before the exact O(N^2) 20-neighbor
+                # filter instead of spending work on points that are discarded.
+                if len(pc_t) > target_n:
+                    pc_t = resample_point_cloud_fixed(pc_t, target_n)
+                pc_t = filter_and_resample_point_cloud(pc_t, num_points=target_n)
+            else:
+                pc_t = resample_point_cloud_fixed(pc_t, target_n)
             center = pc_t.mean(dim=0)
             centers.append(center)
             centered = pc_t - center[None]
@@ -339,8 +416,7 @@ class GraspGenXSampler:
         data_batch = collate(data_items)
         data_batch["grasp_key"] = "grasps_pred"
 
-        # Set the diffusion sampler to produce num_grasps per object; the
-        # model's batched forward already returns (N, num_grasps, 4, 4).
+        # Set the diffusion sampler to produce num_grasps per object.
         grasp_sampler.model.grasp_generator.num_grasps_per_object = num_grasps
 
         with torch.inference_mode():
@@ -358,9 +434,8 @@ class GraspGenXSampler:
                 g_i = g_i[keep]
                 c_i = c_i[keep]
             if topk_num_grasps != -1 and len(g_i) > topk_num_grasps:
-                order = torch.argsort(c_i, descending=True)[:topk_num_grasps]
+                c_i, order = torch.topk(c_i, topk_num_grasps, largest=True, sorted=True)
                 g_i = g_i[order]
-                c_i = c_i[order]
             # Restore world frame.
             if len(g_i) > 0:
                 g_i = g_i.clone()
@@ -377,15 +452,14 @@ class GraspGenXSampler:
     @torch.inference_mode()
     def sample(
         self,
-        obj_pcd: np.ndarray,
+        obj_pcd: np.ndarray | torch.Tensor,
         threshold: float = -1.0,
-        num_grasps: int = 200,
+        num_grasps: int | None = None,
         remove_outliers: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             obj_pcd: np.array of shape (N, 3)
-            obj_pts_color (Optional): np.array of shape (N, 4)
 
         Returns:
             grasps: torch.tensor of shape (M, 6)
@@ -393,19 +467,27 @@ class GraspGenXSampler:
             grasp_contacts: torch.tensor of shape (M, 3)
         """
 
+        if num_grasps is None:
+            num_grasps = self.diffusion_grasps
+        if self.using_fast_inference:
+            grasps, grasp_conf = self._sample_native(
+                obj_pcd, threshold, int(num_grasps)
+            )
+            return grasps, grasp_conf, None
+        if isinstance(obj_pcd, np.ndarray):
+            obj_pcd = torch.from_numpy(obj_pcd).cuda().float()
+        if len(obj_pcd) < MIN_OBJECT_POINT_COUNT:
+            raise ValueError(
+                f"sample requires at least {MIN_OBJECT_POINT_COUNT} object "
+                f"points; received {len(obj_pcd)}"
+            )
+        target_n = int(self.cfg.data.num_points)
         if remove_outliers:
-            obj_pcd_filtered, _ = point_cloud_outlier_removal(obj_pcd)
-            if len(obj_pcd_filtered) >= 10:
-                obj_pcd = obj_pcd_filtered
-            else:
-                logger.warning(
-                    "Outlier removal left %d/%d points; using the unfiltered "
-                    "point cloud.",
-                    len(obj_pcd_filtered),
-                    len(obj_pcd),
-                )
-        if len(obj_pcd) == 0:
-            return [], [], []
+            if len(obj_pcd) > target_n:
+                obj_pcd = resample_point_cloud_fixed(obj_pcd, target_n)
+            obj_pcd = filter_and_resample_point_cloud(obj_pcd, num_points=target_n)
+        else:
+            obj_pcd = resample_point_cloud_fixed(obj_pcd, target_n)
 
         obj_pcd_center = obj_pcd.mean(axis=0)
         obj_pts_color = torch.zeros_like(obj_pcd)
@@ -447,61 +529,123 @@ class GraspGenXSampler:
         return grasps, grasp_conf, None
 
     @torch.inference_mode()
+    def sample_moe(
+        self,
+        obj_pcd: np.ndarray | torch.Tensor,
+        threshold: float = -1.0,
+        num_grasps: int | None = None,
+        remove_outliers: bool = True,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Run the native C++ diffusion + OBB pipeline once."""
+        if num_grasps is None:
+            num_grasps = self.diffusion_grasps
+        if not self.using_fast_inference:
+            raise RuntimeError("sample_moe requires the native C++ runtime")
+        result = self._native_result(obj_pcd, int(num_grasps))
+        diffusion_branch = result.source_indices < self.native_runtime.diffusion_grasps
+        grasps_diff = result.grasps[diffusion_branch]
+        scores_diff = result.confidence[diffusion_branch]
+        grasps_obb = result.grasps[~diffusion_branch]
+        scores_obb = result.confidence[~diffusion_branch]
+        if threshold > 0.0:
+            keep_diff = scores_diff >= threshold
+            grasps_diff = grasps_diff[keep_diff]
+            scores_diff = scores_diff[keep_diff]
+            keep_obb = scores_obb >= threshold
+            grasps_obb = grasps_obb[keep_obb]
+            scores_obb = scores_obb[keep_obb]
+
+        bounds = result.obb_bounds
+        center_local = 0.5 * (bounds[:3] + bounds[3:6])
+        cosine, sine = bounds[6], bounds[7]
+        obb_parameters = torch.empty((8,), device=bounds.device, dtype=bounds.dtype)
+        obb_parameters[0] = (
+            cosine * center_local[0] - sine * center_local[1] + result.object_center[0]
+        )
+        obb_parameters[1] = (
+            sine * center_local[0] + cosine * center_local[1] + result.object_center[1]
+        )
+        obb_parameters[2] = center_local[2] + result.object_center[2]
+        obb_parameters[3:6] = 0.5 * (bounds[3:6] - bounds[:3])
+        obb_parameters[6:] = bounds[6:]
+        return grasps_diff, scores_diff, grasps_obb, scores_obb, obb_parameters
+
+    @torch.inference_mode()
     def load_gripper_input(self, outputs):
-
-        outputs["z_offset"] = torch.tensor(
-            (self.gripper.depth,), dtype=torch.float32
-        ).cuda()
-        outputs["sweep_volume"] = torch.from_numpy(
-            self.gripper.sweep_volume.astype(np.float32)
-        ).cuda()
-        outputs["gripper_type"] = self.gripper.gripper_type
-
-        sweep_volume_open = self.gripper.sweep_volume.astype(np.float32)
-        sweep_volume_mid = self.gripper.sweep_volume_mid.astype(np.float32)
-        outputs["sweep_volume_open_and_mid"] = torch.from_numpy(
-            np.concatenate([sweep_volume_open, sweep_volume_mid], axis=0)
-        ).cuda()
-
-        gripper_open_ptc = self.gripper.open_pointcloud.copy()
-        gripper_close_ptc = self.gripper.close_pointcloud.copy()
-
-        mask = np.random.randint(
-            0, gripper_open_ptc.shape[0], (self.cfg.data.num_points,)
-        )
-        gripper_open_ptc = torch.from_numpy(
-            gripper_close_ptc[mask].astype(np.float32)
-        ).cuda()
-
-        mask = np.random.randint(
-            0, gripper_close_ptc.shape[0], (self.cfg.data.num_points,)
-        )
-        gripper_close_ptc = torch.from_numpy(
-            gripper_close_ptc[mask].astype(np.float32)
-        ).cuda()
-
-        outputs["gripper_open_ptc"] = gripper_open_ptc
-        outputs["gripper_close_ptc"] = gripper_close_ptc
-
-        vol_tsdf = np.stack(
-            [self.gripper.vol_tsdf[f"open_tsdf"], self.gripper.vol_tsdf[f"close_tsdf"]],
-            axis=0,
-        )
-        outputs["gripper_vol_tsdf"] = torch.from_numpy(
-            vol_tsdf.astype(np.float32)
-        ).cuda()
-
-        outputs["gripper_pointnet_repr"] = torch.from_numpy(
-            np.concatenate(
-                [
-                    self.gripper.pointnet_vae["open"],
-                    self.gripper.pointnet_vae["half"],
-                    self.gripper.pointnet_vae["close"],
-                ],
-                axis=0,
-            ).astype(np.float32)
-        ).cuda()
-
+        device = next(self.model.parameters()).device
+        cache_key = (device.type, device.index)
+        cached = self._gripper_input_cache.get(cache_key)
+        if cached is None:
+            backbones = {
+                self.model.grasp_generator.gripper_backbone,
+                self.model.grasp_discriminator.gripper_backbone,
+            }
+            cached = {}
+            if "z_offset" in backbones:
+                cached["z_offset"] = torch.tensor(
+                    (self.gripper.depth,), dtype=torch.float32, device=device
+                )
+            if "sweep_volume" in backbones:
+                cached["sweep_volume"] = torch.as_tensor(
+                    self.gripper.sweep_volume,
+                    dtype=torch.float32,
+                    device=device,
+                )
+            if backbones.intersection(
+                {"sweep_volume_v2", "gripper_type+sweep_volume_v2"}
+            ):
+                sweep = np.concatenate(
+                    [self.gripper.sweep_volume, self.gripper.sweep_volume_mid],
+                    axis=0,
+                )
+                cached["sweep_volume_open_and_mid"] = torch.as_tensor(
+                    sweep, dtype=torch.float32, device=device
+                )
+            if backbones.intersection({"gripper_type", "gripper_type+sweep_volume_v2"}):
+                cached["gripper_type"] = self.gripper.gripper_type
+            if "pointcloud" in backbones:
+                target_n = int(self.cfg.data.num_points)
+                for output_key, point_cloud in (
+                    ("gripper_open_ptc", self.gripper.open_pointcloud),
+                    ("gripper_close_ptc", self.gripper.close_pointcloud),
+                ):
+                    point_cloud = torch.as_tensor(
+                        point_cloud, dtype=torch.float32, device=device
+                    )
+                    cached[output_key] = resample_point_cloud_fixed(
+                        point_cloud, target_n
+                    )
+            if "volume_tsdf" in backbones:
+                vol_tsdf = np.stack(
+                    [
+                        self.gripper.vol_tsdf["open_tsdf"],
+                        self.gripper.vol_tsdf["close_tsdf"],
+                    ],
+                    axis=0,
+                )
+                cached["gripper_vol_tsdf"] = torch.as_tensor(
+                    vol_tsdf, dtype=torch.float32, device=device
+                )
+            if "pointnet_repr" in backbones:
+                pointnet_repr = np.concatenate(
+                    [
+                        self.gripper.pointnet_vae["open"],
+                        self.gripper.pointnet_vae["half"],
+                        self.gripper.pointnet_vae["close"],
+                    ],
+                    axis=0,
+                )
+                cached["gripper_pointnet_repr"] = torch.as_tensor(
+                    pointnet_repr, dtype=torch.float32, device=device
+                )
+            self._gripper_input_cache[cache_key] = cached
+        outputs.update(cached)
         return outputs
 
     def get_gripper_info(self):

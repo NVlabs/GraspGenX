@@ -69,16 +69,17 @@ Pick **uv** for inference, **Docker** for training (Docker also does inference).
 git clone https://github.com/NVlabs/GraspGenX.git && cd GraspGenX && uv sync
 ```
 
-Python ≥ 3.10; torch is pinned `>=2.1,<2.7` and uv auto-selects the matching
-CUDA wheel (`torch-backend = "auto"`). `pip install -e .` also works inside a
-conda / venv on Python 3.10 or 3.11.
+Python >= 3.10. `pip install -e .` also works inside a conda or venv. Add the
+`fast-inference` extra only for the native C++ runtime.
 
 **Optional extras** (add only what you need):
 
 | Command | Adds |
 |---------|------|
 | `uv sync --extra serve` | ZMQ client-server (`pyzmq`, `msgpack`, `msgpack-numpy`) |
-| `uv sync --extra tensorrt` | TensorRT acceleration for the diffusion denoiser |
+| `uv sync --extra fast-inference` | Native C++ one-object fast-inference runtime |
+| `uv sync --extra training` | Training and dataset utilities |
+| `uv sync --extra visualization` | Viser demos and offline rendering |
 | `uv sync --extra end2end` | cuRobo + Newton/MuJoCo + CoACD + USD + fcl (pick-and-place) |
 | `uv sync --extra dev` | `black`, `isort`, `flake8` |
 
@@ -255,8 +256,8 @@ uv run python client-server/graspgenx_server.py \
 ```
 
 `--config` is the checkpoint **root** directory (the one containing `gen/` and
-`dis/`), *not* the inner `config.yaml`. Optional TensorRT: `--tensorrt
---tensorrt_precision {fp32,fp16} --tensorrt_rollout {per_step,unrolled}`. The
+`dis/`), *not* the inner `config.yaml`. Add `--fast-inference` to delegate the
+complete optimized pipeline to the native C++ runtime. The
 model loads eagerly at startup; per-gripper samplers load lazily and are cached.
 
 ### Wire actions (four modes)
@@ -386,7 +387,7 @@ approach→grasp→lift trajectory to a reachable, collision-free grasp →
 ### Install
 
 ```bash
-uv sync                                 # base
+uv sync --extra fast-inference          # native C++ fast inference
 uv sync --extra end2end                 # + cuRobo, Newton/MuJoCo, CoACD, USD, fcl
 python end2end/setup_end2end_deps.py    # clones cuRobo source into ext/curobo, builds merged URDFs
 ```

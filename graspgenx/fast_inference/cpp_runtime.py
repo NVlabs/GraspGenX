@@ -1,0 +1,454 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Thin PyTorch boundary for the PyTorch-free native GraspGenX runtime.
+
+PyTorch owns only the caller stream plus input/output storage. TensorRT
+contexts, persistent intermediates, internal streams, and CUDA Graphs remain
+owned by ``libgraspgenx_runtime``. The ABI is a small C interface so the native
+library never links LibTorch, ATen, or Python.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+
+MIN_OBJECT_POINT_COUNT = 100
+ENGINE_POINT_COUNT = 3500
+_ROOT = Path(__file__).resolve().parents[2]
+_LIBRARY_ENV = "GRASPGENX_CPP_RUNTIME_LIBRARY"
+_ARTIFACT_ENV = "GRASPGENX_CPP_RUNTIME_ARTIFACTS"
+
+
+class _Config(ctypes.Structure):
+    _fields_ = [
+        ("artifact_directory", ctypes.c_char_p),
+        ("initial_gripper_depth", ctypes.c_float),
+        ("diffusion_steps", ctypes.c_int),
+        ("diffusion_grasps", ctypes.c_int),
+        ("obb_grasps", ctypes.c_int),
+    ]
+
+
+def _library_candidates(explicit: str | os.PathLike[str] | None):
+    if explicit is not None:
+        yield Path(explicit).expanduser()
+        return
+    configured = os.environ.get(_LIBRARY_ENV)
+    if configured:
+        yield Path(configured).expanduser()
+    yield _ROOT / "graspgenx/fast_inference/lib/libgraspgenx_runtime.so"
+    yield _ROOT / "cpp_runtime/build-native/libgraspgenx_runtime.so"
+    yield _ROOT / "cpp_runtime/build/libgraspgenx_runtime.so"
+    discovered = ctypes.util.find_library("graspgenx_runtime")
+    if discovered:
+        yield Path(discovered)
+
+
+def resolve_runtime_library(
+    library_path: str | os.PathLike[str] | None = None,
+) -> Path:
+    checked = []
+    for candidate in _library_candidates(library_path):
+        checked.append(str(candidate))
+        if candidate.is_file():
+            return candidate.resolve()
+        # ``find_library`` may return a soname resolved by the dynamic loader.
+        if candidate.parent == Path(".") and "/" not in str(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "Could not find libgraspgenx_runtime.so. Build cpp_runtime and set "
+        f"{_LIBRARY_ENV}; checked: {checked}"
+    )
+
+
+def resolve_artifact_directory(
+    artifact_directory: str | os.PathLike[str] | None,
+    *,
+    diffusion_grasps: int,
+    obb_grasps: int,
+    diffusion_steps: int = 20,
+) -> Path:
+    value = artifact_directory or os.environ.get(_ARTIFACT_ENV)
+    directory = (
+        Path(value).expanduser()
+        if value is not None
+        else _ROOT / "cpp_runtime/artifacts"
+    ).resolve()
+    required = required_runtime_artifacts(
+        directory,
+        diffusion_steps=diffusion_steps,
+        diffusion_grasps=diffusion_grasps,
+        obb_grasps=obb_grasps,
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Native GraspGenX artifacts are missing. Run "
+            "`graspgenx-install-fast-inference` or set "
+            f"{_ARTIFACT_ENV}. Missing: {missing}"
+        )
+    return directory
+
+
+def required_runtime_artifacts(
+    directory: str | os.PathLike[str],
+    *,
+    diffusion_steps: int,
+    diffusion_grasps: int,
+    obb_grasps: int,
+) -> tuple[Path, ...]:
+    """Return every count- and schedule-specific file consumed by C++."""
+    directory = Path(directory)
+    engines = directory / "engines"
+    weights = directory / "weights"
+    schedule = weights / "schedules" / str(int(diffusion_steps))
+    ptv3_plans = tuple(
+        engines / "ptv3" / f"ptv3_{branch}_stage{stage}_fp16.plan"
+        for branch in ("generator", "discriminator")
+        for stage in range(5)
+    )
+    return (
+        *ptv3_plans,
+        directory / "engines" / f"denoiser_core_d{int(diffusion_grasps)}_fp16.plan",
+        engines / f"scorer_core_c{int(diffusion_grasps) + int(obb_grasps)}_fp32.plan",
+        weights / "observation_weight.bin",
+        weights / "sample_encoder_weight.bin",
+        weights / "sample_encoder_bias.bin",
+        weights / "prediction_weight.bin",
+        weights / "prediction_bias.bin",
+        weights / f"sobol_initial_sample_d{int(diffusion_grasps)}.bin",
+        schedule / "timestep_conditioning.bin",
+        schedule / "ddpm_coefficients.bin",
+    )
+
+
+def _configure_library(library):
+    void_p = ctypes.c_void_p
+    library.graspgenx_runtime_last_error.argtypes = []
+    library.graspgenx_runtime_last_error.restype = ctypes.c_char_p
+    library.graspgenx_runtime_create.argtypes = [
+        ctypes.POINTER(_Config),
+        ctypes.POINTER(void_p),
+    ]
+    library.graspgenx_runtime_create.restype = ctypes.c_int
+    library.graspgenx_runtime_destroy.argtypes = [void_p]
+    library.graspgenx_runtime_destroy.restype = None
+    library.graspgenx_runtime_device.argtypes = [void_p, ctypes.POINTER(ctypes.c_int)]
+    library.graspgenx_runtime_device.restype = ctypes.c_int
+    library.graspgenx_runtime_grasp_count.argtypes = [
+        void_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    library.graspgenx_runtime_grasp_count.restype = ctypes.c_int
+    library.graspgenx_runtime_set_gripper_device_async.argtypes = [
+        void_p,
+        void_p,
+        void_p,
+        ctypes.c_float,
+        void_p,
+    ]
+    library.graspgenx_runtime_set_gripper_device_async.restype = ctypes.c_int
+    library.graspgenx_runtime_infer_device_async.argtypes = [
+        void_p,
+        void_p,
+        ctypes.c_int64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+    ]
+    library.graspgenx_runtime_infer_device_async.restype = ctypes.c_int
+    return library
+
+
+@dataclass(frozen=True)
+class NativeGripperEmbeddings:
+    generator: torch.Tensor
+    discriminator: torch.Tensor
+    depth: float
+
+
+@dataclass(frozen=True)
+class NativeInferenceResult:
+    grasps: torch.Tensor
+    confidence: torch.Tensor
+    source_indices: torch.Tensor
+    object_center: torch.Tensor
+    obb_bounds: torch.Tensor
+    ptv3_stage_counts: torch.Tensor
+    ptv3_topology_overflow: torch.Tensor
+
+
+class NativeCppRuntime:
+    """One-object native runtime with persistent PyTorch output storage.
+
+    One instance supports one ordered in-flight sequence. Returned tensors are
+    overwritten by the next call; application-level sampler methods return
+    indexed tensors with independent storage.
+    """
+
+    def __init__(
+        self,
+        *,
+        artifact_directory: str | os.PathLike[str] | None = None,
+        library_path: str | os.PathLike[str] | None = None,
+        diffusion_steps: int = 20,
+        diffusion_grasps: int = 100,
+        obb_grasps: int = 50,
+        device: int | torch.device | None = None,
+        seed: int | None = None,
+    ):
+        self.diffusion_steps = int(diffusion_steps)
+        self.diffusion_grasps = int(diffusion_grasps)
+        self.obb_grasps = int(obb_grasps)
+        if self.diffusion_steps not in (5, 10, 20):
+            raise ValueError("diffusion_steps must be one of 5, 10, or 20")
+        if self.diffusion_grasps < 1:
+            raise ValueError("diffusion_grasps must be positive")
+        if self.obb_grasps < 0 or self.diffusion_grasps + self.obb_grasps > 4096:
+            raise ValueError(
+                "obb_grasps must be non-negative and combined candidates <= 4096"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("the native GraspGenX runtime requires CUDA")
+        if device is None:
+            device_index = torch.cuda.current_device()
+        else:
+            resolved = torch.device(device)
+            if resolved.type != "cuda":
+                raise ValueError(f"native runtime device must be CUDA, got {resolved}")
+            device_index = (
+                torch.cuda.current_device()
+                if resolved.index is None
+                else int(resolved.index)
+            )
+        self.artifact_directory = resolve_artifact_directory(
+            artifact_directory,
+            diffusion_steps=self.diffusion_steps,
+            diffusion_grasps=self.diffusion_grasps,
+            obb_grasps=self.obb_grasps,
+        )
+        self.library_path = resolve_runtime_library(library_path)
+        self._library = _configure_library(ctypes.CDLL(str(self.library_path)))
+        self._handle = ctypes.c_void_p()
+        config = _Config(
+            str(self.artifact_directory).encode(),
+            ctypes.c_float(0.1034),
+            self.diffusion_steps,
+            self.diffusion_grasps,
+            self.obb_grasps,
+        )
+        with torch.cuda.device(device_index):
+            self._check(
+                self._library.graspgenx_runtime_create(
+                    ctypes.byref(config), ctypes.byref(self._handle)
+                ),
+                "create native runtime",
+            )
+        native_device = ctypes.c_int(-1)
+        self._check(
+            self._library.graspgenx_runtime_device(
+                self._handle, ctypes.byref(native_device)
+            ),
+            "query native runtime device",
+        )
+        self.device = torch.device("cuda", native_device.value)
+        self.grasp_count = self.diffusion_grasps + self.obb_grasps
+        native_count = ctypes.c_int(-1)
+        self._check(
+            self._library.graspgenx_runtime_grasp_count(
+                self._handle, ctypes.byref(native_count)
+            ),
+            "query native grasp count",
+        )
+        if native_count.value != self.grasp_count:
+            raise RuntimeError(
+                f"native grasp count {native_count.value} != {self.grasp_count}"
+            )
+        self._result = NativeInferenceResult(
+            grasps=torch.empty(
+                (self.grasp_count, 4, 4), device=self.device, dtype=torch.float32
+            ),
+            confidence=torch.empty(
+                self.grasp_count, device=self.device, dtype=torch.float32
+            ),
+            source_indices=torch.empty(
+                self.grasp_count, device=self.device, dtype=torch.int32
+            ),
+            object_center=torch.empty(3, device=self.device, dtype=torch.float32),
+            obb_bounds=torch.empty(8, device=self.device, dtype=torch.float32),
+            ptv3_stage_counts=torch.empty(5, device=self.device, dtype=torch.int64),
+            ptv3_topology_overflow=torch.empty(
+                4, device=self.device, dtype=torch.uint8
+            ),
+        )
+        self.seed = int(torch.initial_seed() if seed is None else seed) & (
+            (1 << 64) - 1
+        )
+        self.sequence_offset = 0
+
+    def close(self):
+        handle = getattr(self, "_handle", None)
+        if handle is not None and handle.value:
+            # Runtime destruction owns CUDA resources and is therefore ordered
+            # only after all previously enqueued work is complete.
+            torch.cuda.synchronize(self.device)
+            self._library.graspgenx_runtime_destroy(handle)
+            handle.value = None
+
+    def __del__(self):  # pragma: no cover - interpreter shutdown is best effort
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - interpreter teardown is best effort
+            return
+
+    def _check(self, status: int, operation: str):
+        if status == 0:
+            return
+        detail = self._library.graspgenx_runtime_last_error()
+        message = detail.decode(errors="replace") if detail else "unknown error"
+        raise RuntimeError(f"{operation}: {message}")
+
+    @staticmethod
+    def _pointer(tensor: torch.Tensor):
+        return ctypes.c_void_p(tensor.data_ptr())
+
+    def infer(
+        self,
+        points: torch.Tensor,
+        gripper: NativeGripperEmbeddings,
+        *,
+        seed: int | None = None,
+        sequence_offset: int | None = None,
+    ) -> NativeInferenceResult:
+        if points.ndim == 3 and points.shape[0] == 1:
+            points = points[0]
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(
+                f"points must have shape [N,3] or [1,N,3], got {points.shape}"
+            )
+        if len(points) < MIN_OBJECT_POINT_COUNT:
+            raise ValueError(
+                f"GraspGenX requires at least {MIN_OBJECT_POINT_COUNT} points; "
+                f"received {len(points)}"
+            )
+        points = points.to(device=self.device, dtype=torch.float32).contiguous()
+        generator = gripper.generator
+        discriminator = gripper.discriminator
+        if (
+            generator.device != self.device
+            or generator.dtype != torch.float16
+            or tuple(generator.shape) != (512,)
+            or not generator.is_contiguous()
+        ):
+            raise ValueError(
+                "generator gripper embedding must be contiguous CUDA FP16 [512]"
+            )
+        if (
+            discriminator.device != self.device
+            or discriminator.dtype != torch.float32
+            or tuple(discriminator.shape) != (512,)
+            or not discriminator.is_contiguous()
+        ):
+            raise ValueError(
+                "discriminator gripper embedding must be contiguous CUDA FP32 [512]"
+            )
+        caller_stream = torch.cuda.current_stream(self.device)
+        stream_pointer = ctypes.c_void_p(caller_stream.cuda_stream)
+        self._check(
+            self._library.graspgenx_runtime_set_gripper_device_async(
+                self._handle,
+                self._pointer(generator),
+                self._pointer(discriminator),
+                ctypes.c_float(float(gripper.depth)),
+                stream_pointer,
+            ),
+            "set native gripper",
+        )
+        call_seed = self.seed if seed is None else int(seed) & ((1 << 64) - 1)
+        call_offset = (
+            self.sequence_offset
+            if sequence_offset is None
+            else int(sequence_offset) & ((1 << 64) - 1)
+        )
+        output = self._result
+        self._check(
+            self._library.graspgenx_runtime_infer_device_async(
+                self._handle,
+                self._pointer(points),
+                len(points),
+                ctypes.c_uint64(call_seed),
+                ctypes.c_uint64(call_offset),
+                self._pointer(output.grasps),
+                self._pointer(output.confidence),
+                self._pointer(output.source_indices),
+                self._pointer(output.object_center),
+                self._pointer(output.obb_bounds),
+                self._pointer(output.ptv3_stage_counts),
+                self._pointer(output.ptv3_topology_overflow),
+                stream_pointer,
+            ),
+            "native device inference",
+        )
+        if sequence_offset is None:
+            random_pairs = self.diffusion_steps * self.diffusion_grasps * 3
+            self.sequence_offset = (self.sequence_offset + random_pairs) & (
+                (1 << 64) - 1
+            )
+        return output
+
+
+def encode_gripper_embeddings(
+    model, descriptor, depth: float
+) -> NativeGripperEmbeddings:
+    """Encode a released 12D sweep-volume descriptor once for native inference."""
+    generator = model.grasp_generator
+    discriminator = model.grasp_discriminator
+    if generator.gripper_backbone != "sweep_volume_v2" or (
+        discriminator.gripper_backbone != "sweep_volume_v2"
+    ):
+        raise ValueError(
+            "native C++ artifacts currently require sweep_volume_v2 gripper encoders"
+        )
+    device = next(generator.gripper_encoder.parameters()).device
+    value = torch.as_tensor(descriptor, dtype=torch.float32, device=device).reshape(
+        1, 12
+    )
+    with torch.inference_mode():
+        generator_value = (
+            generator.gripper_encoder(value).reshape(512).to(torch.float16).contiguous()
+        )
+        discriminator_value = (
+            discriminator.gripper_encoder(value).reshape(512).float().contiguous()
+        )
+    return NativeGripperEmbeddings(
+        generator=generator_value,
+        discriminator=discriminator_value,
+        depth=float(depth),
+    )
+
+
+__all__ = [
+    "ENGINE_POINT_COUNT",
+    "MIN_OBJECT_POINT_COUNT",
+    "NativeCppRuntime",
+    "NativeGripperEmbeddings",
+    "NativeInferenceResult",
+    "encode_gripper_embeddings",
+    "required_runtime_artifacts",
+    "resolve_artifact_directory",
+    "resolve_runtime_library",
+]

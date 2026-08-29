@@ -30,7 +30,7 @@ from pathlib import Path
 from omegaconf import DictConfig
 
 from graspgenx.models.grasp_gen import GraspGen
-from graspgenx.dataset.dataset import collate
+from graspgenx.batching import collate
 
 
 # ─── Fixtures ───────────────────────────────────────────────────────────────

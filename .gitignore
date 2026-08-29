@@ -9,7 +9,9 @@ output_real/
 # Build artifacts
 *.o
 *.so
+/build/
 pointnet2_ops/build/
+cpp_runtime/build*/
 *.egg-info/
 
 uv.lock
@@ -30,10 +32,12 @@ runs_local/
 swipat/
 mcp/
 
+# Local development notes, experiment scripts, and benchmark results
+/notes/
+
 # External dependencies cloned at runtime
 ext/*
 
 # end2end: generated merged robot URDFs/configs + run outputs (not committed)
 end2end/curobo_assets/
 end2end/runs/
-

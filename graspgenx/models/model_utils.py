@@ -14,10 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from graspgenx.models.pointnet.pointnet2_modules import (
-    PointnetSAModule,
-    PointnetSAModuleMSG,
-)
 from graspgenx.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -158,6 +154,14 @@ class PointNetPlusPlus(nn.Module):
         feature_dim=-1,
         pointnet_version="v1",
     ):
+        # PointNet2 is optional. Import its extension only when a PointNet2
+        # backbone is actually constructed; the released PTV3 inference path
+        # must not JIT-probe or require pointnet2_ops at module import time.
+        from graspgenx.models.pointnet.pointnet2_modules import (
+            PointnetSAModule,
+            PointnetSAModuleMSG,
+        )
+
         super().__init__()
         self.activation = activation
         self.output_embedding_dim = output_embedding_dim
@@ -245,6 +249,8 @@ class PointNetPlusPlusExtra(nn.Module):
     def __init__(
         self, activation="relu", bn=False, output_embedding_dim=512, feature_dim=-1
     ):
+        from graspgenx.models.pointnet.pointnet2_modules import PointnetSAModule
+
         mlp = []
         for elem in OBJ_MLPS_EXTRA:
             mlp.append(elem.copy())

@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from collections import OrderedDict
-from graspgenx.dataset.dataset import MAPPING_ID2NAME
+from graspgenx.grasp_labels import MAPPING_ID2NAME
 from graspgenx.utils.transformations import matrix_to_rt
 from graspgenx.models.model_utils import (
     PointNetPlusPlus,
@@ -27,8 +27,6 @@ from graspgenx.models.model_utils import (
 from graspgenx.robot import get_gripper_info
 from graspgenx.utils.logging_config import get_logger
 from graspgenx.models.model_utils import load_pretrained_checkpoint_to_dict
-
-from sklearn.metrics import average_precision_score
 
 logger = get_logger(__name__)
 
@@ -509,6 +507,8 @@ class GraspGenDiscriminator(nn.Module):
 
             labels = labels.squeeze(1).cpu().numpy()
             score = pred.squeeze(1).detach().cpu().numpy()
+            from sklearn.metrics import average_precision_score
+
             ap = average_precision_score(labels, score)
             stats["ap"] = torch.tensor(ap).to(device)
 

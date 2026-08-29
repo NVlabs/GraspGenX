@@ -37,7 +37,15 @@ def _resolve_default_checkpoints() -> str:
     Returns the version subdir under $GRASPGENX_CHECKPOINT_DIR or the
     auto-cloned <repo>/ext/graspgenx_checkpoints/.
     """
-    return str(get_checkpoints_version_dir())
+    resolved = get_checkpoints_version_dir()
+    if (resolved / "gen" / "config.yaml").is_file():
+        return str(resolved)
+    # Some local clones retain the Git repository's top-level
+    # ``GraspGenXModel`` directory under ext/graspgenx_checkpoints.
+    nested = resolved.parent / "GraspGenXModel" / resolved.name
+    if (nested / "gen" / "config.yaml").is_file():
+        return str(nested)
+    return str(resolved)
 
 
 def parse_args():
@@ -153,13 +161,16 @@ def parse_args():
     parser.add_argument(
         "--moe_num_yaws",
         type=int,
-        default=36,
-        help="[graspmoe] Number of world-Z yaw samples for OBB sweep.",
+        default=None,
+        help=(
+            "[graspmoe] World-Z yaw samples; defaults to the configured CUDA "
+            "candidate count or 10 yaws in eager mode."
+        ),
     )
     parser.add_argument(
         "--moe_z_offsets_cm",
         type=str,
-        default="-2,0",
+        default="-8,-6,-4,-2,0",
         help="[graspmoe] Comma-separated Z offsets (cm) relative to OBB top.",
     )
     parser.add_argument(
@@ -177,7 +188,7 @@ def parse_args():
     parser.add_argument(
         "--moe_obb_mode",
         type=str,
-        default="advanced",
+        default="pca",
         choices=["advanced", "pca"],
         help="[graspmoe] OBB algorithm: 'advanced' (SOR + hull + rotating calipers) "
         "or 'pca' fallback.",
@@ -185,7 +196,7 @@ def parse_args():
     parser.add_argument(
         "--moe_skip_obb_rule",
         type=str,
-        default="auto",
+        default="never",
         choices=["auto", "never"],
         help="[graspmoe] Skip OBB branch when every OBB extent > gripper width ('auto'), "
         "or always run it ('never').",
@@ -193,12 +204,12 @@ def parse_args():
     parser.add_argument(
         "--moe_obb_density",
         type=str,
-        default="dense-topandside",
+        default="sparse",
         choices=["sparse", "dense", "dense-topandside"],
         help="[graspmoe] OBB candidate placement. 'sparse' puts every candidate at "
         "the OBB centroid (top-down, yaw + Z sweep only). 'dense' sweeps "
         "positions along the OBB's longer XY axis (top-down). "
-        "'dense-topandside' (default) also adds horizontal-approach grasps on the 4 "
+        "'dense-topandside' also adds horizontal-approach grasps on the 4 "
         "side faces of the OBB.",
     )
     parser.add_argument(
@@ -219,18 +230,13 @@ def parse_args():
         help="Real-world format only: skip objects whose segmented PC has fewer points.",
     )
     parser.add_argument(
-        "--tensorrt",
+        "--fast-inference",
         action="store_true",
-        help="Compile the diffusion denoiser to TensorRT for faster inference "
-        "(opt-in; requires the 'tensorrt' extra: `uv sync --extra tensorrt`). "
-        "Falls back to eager PyTorch if TensorRT is unavailable.",
-    )
-    parser.add_argument(
-        "--tensorrt_precision",
-        type=str,
-        default="fp32",
-        choices=["fp32", "fp16"],
-        help="TensorRT precision when --tensorrt is set (default: fp32 for parity).",
+        help="Use the native C++ fast-inference runtime through its C ABI. "
+        "Install it with `graspgenx-install-fast-inference`; custom locations "
+        "can use GRASPGENX_CPP_RUNTIME_LIBRARY and "
+        "GRASPGENX_CPP_RUNTIME_ARTIFACTS. Falls back to eager PyTorch if "
+        "unavailable.",
     )
     return parser.parse_args()
 
@@ -430,15 +436,16 @@ if __name__ == "__main__":
     vis = create_visualizer()
 
     for gripper_name in args.gripper_name:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Loading gripper: {gripper_name}")
         print(f"Assets directory: {args.assets_dir}")
         grasp_sampler = GraspGenXSampler(
             model_cfg,
             gripper_name,
             assets_dir=args.assets_dir,
-            use_tensorrt=args.tensorrt,
-            tensorrt_precision=args.tensorrt_precision,
+            use_fast_inference=args.fast_inference,
+            diffusion_grasps=args.num_grasps,
+            obb_grasps=(args.moe_num_yaws or 10) * len(z_offsets_cm),
         )
         gripper = grasp_sampler.get_gripper_info()
 

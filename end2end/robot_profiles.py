@@ -118,6 +118,11 @@ class RobotProfile:
     # — independent of how the joint is actuated.
     use_coacd_for_gripper: bool = True
 
+    # Fixed-link collapsing is normally desirable, but some profiles select
+    # collision treatment by the names of fixed child links.  Those profiles
+    # can preserve the link bodies so the selector remains unambiguous.
+    collapse_fixed_joints: bool = True
+
     # Joint armature for the gripper master joints. Newton's PD is
     # unstable on low-inertia prismatic joints without armature; the
     # Newton Panda examples use 0.15–0.5 here.
@@ -206,6 +211,7 @@ class RobotProfile:
             "gripper_control_mode",
             "gripper_close_velocity",
             "gripper_armature",
+            "collapse_fixed_joints",
             "curobo_robot_config",
         ):
             if key in robot_cfg:
@@ -414,6 +420,62 @@ class FrankaPandaProfile(RobotProfile):
         return out
 
 
+@dataclass
+class YamFlexibleProfile(RobotProfile):
+    """YAM six-axis arm with its coupled flexible parallel-jaw gripper."""
+
+    NAME: str = "yam_flexible"
+    arm_joint_names: List[str] = field(
+        default_factory=lambda: [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+        ]
+    )
+    tool_frame: str = "franka_gripper"
+    default_arm_q: List[float] = field(
+        default_factory=lambda: [0.0, 0.3, 1.0, 0.0, 0.0, 0.0]
+    )
+    curobo_robot_config: str = "yam_single.yml"
+
+    # joint8 follows joint7 through the mimic declaration in the URDF.
+    gripper_joint_names: List[str] = field(default_factory=lambda: ["joint7"])
+    gripper_open: Dict[str, float] = field(
+        default_factory=lambda: {"joint7": -0.0475}
+    )
+    gripper_close: Dict[str, float] = field(default_factory=lambda: {"joint7": 0.0})
+    gripper_control_mode: str = "velocity"
+    gripper_close_velocity: Dict[str, float] = field(
+        default_factory=lambda: {"joint7": 0.06}
+    )
+    gripper_armature: float = 0.15
+    # Keep one concave collision mesh per finger component in the URDF.
+    # Newton decomposes only these four meshes into convex MuJoCo geoms when
+    # building the dynamic model; the shared left/right sources are cached by
+    # ModelBuilder, so each unique mesh is decomposed only once.
+    use_coacd_for_gripper: bool = True
+    # Keep the fixed finger_set/finger_flex body labels: Newton's URDF importer
+    # currently emits generic shape labels, so link names are the reliable way
+    # to distinguish these envelopes from the detailed tip-base meshes.
+    collapse_fixed_joints: bool = False
+    gripper_body_keywords: Tuple[str, ...] = (
+        "gripper",
+        "finger",
+        "tip_left",
+        "tip_right",
+    )
+    # Exclude the gripper mount and tip bodies: their collision meshes are
+    # already adequately represented by a single hull.  The finger-set and
+    # flexible-pad meshes contain the inward recess that must survive.
+    coacd_link_keywords: Tuple[str, ...] = ("finger_set", "finger_flex")
+
+    def gripper_pad_links(self) -> Tuple[str, str] | None:
+        return ("left_finger_flex", "right_finger_flex")
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -547,6 +609,7 @@ class UR10eGripperProfile(RobotProfile):
 ROBOT_PROFILES: Dict[str, type] = {
     UR10eRobotiq2F140Profile.NAME: UR10eRobotiq2F140Profile,
     FrankaPandaProfile.NAME: FrankaPandaProfile,
+    YamFlexibleProfile.NAME: YamFlexibleProfile,
     UR10eInspireHandProfile.NAME: UR10eInspireHandProfile,
     UR10eGripperProfile.NAME: UR10eGripperProfile,
 }

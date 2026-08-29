@@ -21,8 +21,12 @@ import numpy as np
 import pytest
 
 pytest.importorskip("zmq", reason="install graspgenx[serve] to exercise serving tests")
-pytest.importorskip("msgpack", reason="install graspgenx[serve] to exercise serving tests")
-pytest.importorskip("msgpack_numpy", reason="install graspgenx[serve] to exercise serving tests")
+pytest.importorskip(
+    "msgpack", reason="install graspgenx[serve] to exercise serving tests"
+)
+pytest.importorskip(
+    "msgpack_numpy", reason="install graspgenx[serve] to exercise serving tests"
+)
 
 
 def test_serving_module_imports():
@@ -65,6 +69,26 @@ def test_dispatch_infer_without_gripper_or_default_raises():
     pc = np.zeros((10, 3), dtype=np.float32)
     with pytest.raises(ValueError, match="gripper_name"):
         srv._dispatch({"action": "infer", "point_cloud": pc})
+
+
+def test_shared_native_runtime_is_propagated_to_new_sampler(monkeypatch):
+    import graspgenx.serving.zmq_server as server_module
+
+    srv = _stub_server()
+    srv._fast_inference_enabled = True
+    srv.cfg = object()
+    srv._shared_model = object()
+
+    class FakeSampler:
+        def __init__(self, *_args, **_kwargs):
+            self.using_fast_inference = False
+
+    monkeypatch.setattr(server_module, "GraspGenXSampler", FakeSampler)
+
+    sampler = srv._get_sampler("test_gripper")
+
+    assert isinstance(sampler, FakeSampler)
+    assert sampler.using_fast_inference
 
 
 def test_round_trip_health_over_zmq():

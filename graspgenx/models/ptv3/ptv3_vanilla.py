@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -20,24 +19,29 @@ Based on the Pointcept PTv3 architecture by Xiaoyang Wu.
 import math
 from collections import OrderedDict
 from functools import partial
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from addict import Dict
-from timm.models.layers import DropPath
+from torch import nn
+from torch.nn import functional as F
 
-# Safe fallback for torch.compiler.disable (not available in PyTorch < 2.1)
-try:
-    _compiler_disable = torch.compiler.disable
-except AttributeError:
 
-    def _compiler_disable(fn=None):
-        """No-op decorator when torch.compiler is unavailable."""
-        if fn is None:
-            return lambda f: f
-        return fn
+class DropPath(nn.Module):
+    """Per-sample stochastic depth without the otherwise-unused timm dependency."""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        keep = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0:
+            keep.div_(keep_prob)
+        return x * keep
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +65,8 @@ class _ZOrderKeyLUT:
             )
         }
 
-    def encode_lut(self, device=torch.device("cpu")):
+    def encode_lut(self, device=None):
+        device = torch.device("cpu") if device is None else device
         if device not in self._encode:
             cpu = torch.device("cpu")
             self._encode[device] = tuple(e.to(device) for e in self._encode[cpu])
@@ -148,8 +153,8 @@ def _hilbert_encode(locs, num_dims, num_bits):
         .flatten(-2, -1)[..., -num_bits:]
     )
 
-    for bit in range(0, num_bits):
-        for dim in range(0, num_dims):
+    for bit in range(num_bits):
+        for dim in range(num_dims):
             mask = gray[:, dim, bit]
             gray[:, 0, bit + 1 :] = torch.logical_xor(
                 gray[:, 0, bit + 1 :], mask[:, None]
@@ -288,6 +293,52 @@ def segment_csr_vanilla(src, indptr, reduce="mean"):
     return out
 
 
+def segment_ids_vanilla(src, seg_ids, num_segments, reduce="mean"):
+    """Static-shape segment reduction used by captured one-object stages."""
+    channels = src.shape[1] if src.dim() > 1 else 1
+    expanded_ids = seg_ids.unsqueeze(-1).expand_as(src)
+    if reduce in ("mean", "sum"):
+        out = torch.zeros(num_segments, channels, device=src.device, dtype=src.dtype)
+        out.scatter_reduce_(
+            0,
+            expanded_ids,
+            src,
+            reduce=reduce,
+            include_self=False,
+        )
+    elif reduce == "max":
+        out = torch.full(
+            (num_segments, channels),
+            float("-inf"),
+            device=src.device,
+            dtype=src.dtype,
+        )
+        out.scatter_reduce_(
+            0,
+            expanded_ids,
+            src,
+            reduce="amax",
+            include_self=False,
+        )
+    elif reduce == "min":
+        out = torch.full(
+            (num_segments, channels),
+            float("inf"),
+            device=src.device,
+            dtype=src.dtype,
+        )
+        out.scatter_reduce_(
+            0,
+            expanded_ids,
+            src,
+            reduce="amin",
+            include_self=False,
+        )
+    else:
+        raise ValueError(f"Unsupported reduce: {reduce}")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # HashSparseConv3d — submanifold sparse 3D conv via hash-table lookup
 # ---------------------------------------------------------------------------
@@ -339,7 +390,37 @@ class HashSparseConv3d(nn.Module):
             + grid_coord[:, 2].long() * P[2]
         )
 
-    def forward(self, feat, grid_coord, batch):
+    def build_neighbor_map(
+        self,
+        grid_coord,
+        batch,
+    ):
+        """Build the feature-independent neighbor topology with PyTorch."""
+        N = grid_coord.shape[0]
+        K3 = self.offsets.shape[0]
+        keys = self._hash(batch, grid_coord)
+        sorted_keys, sort_idx = keys.sort()
+        neighbor_coords = grid_coord.unsqueeze(1) + self.offsets.unsqueeze(0)
+        neighbor_batch = batch.unsqueeze(1).expand(-1, K3)
+        neighbor_keys = self._hash(
+            neighbor_batch.reshape(-1),
+            neighbor_coords.reshape(-1, 3),
+        )
+        positions = torch.searchsorted(sorted_keys, neighbor_keys)
+        positions = positions.clamp(max=N - 1)
+        found_mask = (sorted_keys[positions] == neighbor_keys).view(N, K3)
+        found_indices = sort_idx[positions].view(N, K3)
+        return found_indices, found_mask
+
+    def forward(
+        self,
+        feat,
+        grid_coord,
+        batch,
+        neighbor_map=None,
+        fused_weight=None,
+        fused_bias=None,
+    ):
         """
         Args:
             feat: (N, C_in) point features.
@@ -348,29 +429,14 @@ class HashSparseConv3d(nn.Module):
         Returns:
             (N, C_out) convolved features (same sparsity pattern).
         """
-        N = feat.shape[0]
-        K3 = self.offsets.shape[0]
-        device = feat.device
+        if neighbor_map is None:
+            neighbor_map = self.build_neighbor_map(grid_coord, batch)
+        found_indices, found_mask = neighbor_map
 
-        # Build sorted hash table for all active voxels
-        keys = self._hash(batch, grid_coord)
-        sorted_keys, sort_idx = keys.sort()
-
-        # For each point, compute neighbor keys for all K^3 offsets
-        # neighbor_coords: (N, K3, 3)
-        neighbor_coords = grid_coord.unsqueeze(1) + self.offsets.unsqueeze(0)
-        neighbor_batch = batch.unsqueeze(1).expand(-1, K3)
-        neighbor_keys = self._hash(
-            neighbor_batch.reshape(-1),
-            neighbor_coords.reshape(-1, 3),
-        )  # (N * K3,)
-
-        # Look up neighbors via binary search in sorted keys
-        positions = torch.searchsorted(sorted_keys, neighbor_keys)
-        positions = positions.clamp(max=N - 1)
-        found_mask = sorted_keys[positions] == neighbor_keys
-        found_indices = sort_idx[positions]  # map back to original point indices
-
+        flat_weight = (
+            self.weight.flatten(0, 1) if fused_weight is None else fused_weight
+        )
+        output_bias = self.bias if fused_bias is None else fused_bias
         # Gather neighbor features; zeros where no neighbor exists.
         # Fixed-shape formulation (export/TensorRT-friendly): `found_indices`
         # are already valid (positions clamped to [0, N-1]), so the gather is
@@ -378,12 +444,13 @@ class HashSparseConv3d(nn.Module):
         # had no real neighbor. Numerically identical to the masked-assignment
         # form `neighbor_feat[found_mask] = feat[found_indices[found_mask]]`.
         neighbor_feat = feat[found_indices] * found_mask.unsqueeze(-1)
-        neighbor_feat = neighbor_feat.view(N, K3, self.in_channels)
 
-        # Apply per-offset weights and sum: (N, K3, Cin) x (K3, Cin, Cout) → (N, Cout)
-        out = torch.einsum("nki,kio->no", neighbor_feat, self.weight)
-        if self.bias is not None:
-            out = out + self.bias
+        # This contraction is one ordinary GEMM when both K3 and Cin are
+        # flattened. ``einsum("nki,kio->no")`` decomposes it into many small
+        # offset-wise GEMMs, which leaves tensor cores underutilized.
+        out = neighbor_feat.flatten(1) @ flat_weight
+        if output_bias is not None:
+            out = out + output_bias
         return out
 
 
@@ -402,7 +469,6 @@ class VanillaPoint(Dict):
         elif "offset" not in self.keys() and "batch" in self.keys():
             self["offset"] = batch2offset(self.batch)
 
-    @_compiler_disable
     def serialization(self, order="z", depth=None, shuffle_orders=False):
         assert "batch" in self.keys()
         if "grid_coord" not in self.keys():
@@ -417,10 +483,12 @@ class VanillaPoint(Dict):
         assert depth * 3 + len(self.offset).bit_length() <= 63
         assert depth <= 16
 
-        code = [
-            encode(self.grid_coord, self.batch, depth, order=order_) for order_ in order
-        ]
-        code = torch.stack(code)
+        code = torch.stack(
+            [
+                encode(self.grid_coord, self.batch, depth, order=order_)
+                for order_ in order
+            ]
+        )
         order = torch.argsort(code)
         inverse = torch.zeros_like(order).scatter_(
             dim=1,
@@ -448,8 +516,6 @@ class VanillaPoint(Dict):
 
 class VanillaPointModule(nn.Module):
     """Marker base class: subclasses receive the full VanillaPoint dict."""
-
-    pass
 
 
 class VanillaPointSequential(VanillaPointModule):
@@ -487,7 +553,7 @@ class VanillaPointSequential(VanillaPointModule):
         self.add_module(name, module)
 
     def forward(self, input):
-        for _k, module in self._modules.items():
+        for module in self._modules.values():
             if isinstance(module, VanillaPointModule):
                 input = module(input)
             else:
@@ -578,28 +644,60 @@ class VanillaSerializedAttention(VanillaPointModule):
             else None
         )
 
-    @_compiler_disable
     @torch.no_grad()
     def get_rel_pos(self, point, order):
         K = self.patch_size
         rel_pos_key = f"rel_pos_{self.order_index}"
-        if rel_pos_key not in point.keys():
+        if rel_pos_key not in point:
             grid_coord = point.grid_coord[order]
             grid_coord = grid_coord.reshape(-1, K, 3)
             point[rel_pos_key] = grid_coord.unsqueeze(2) - grid_coord.unsqueeze(1)
         return point[rel_pos_key]
 
-    @_compiler_disable
     @torch.no_grad()
     def get_padding_and_inverse(self, point):
         pad_key = "pad"
         unpad_key = "unpad"
         cu_seqlens_key = "cu_seqlens_key"
         if (
-            pad_key not in point.keys()
-            or unpad_key not in point.keys()
-            or cu_seqlens_key not in point.keys()
+            pad_key not in point
+            or unpad_key not in point
+            or cu_seqlens_key not in point
         ):
+            # The deployment contract is one object per call.  Derive the
+            # padded patch layout from static tensor shapes in that case so
+            # no CUDA scalar is copied to the host in every attention block.
+            # Keep the original multi-object path below for training/tests.
+            if point.offset.numel() == 1:
+                point_count = point.feat.shape[0]
+                padded_count = point_count
+                if point_count > self.patch_size:
+                    padded_count = (
+                        (point_count + self.patch_size - 1) // self.patch_size
+                    ) * self.patch_size
+                pad = torch.arange(padded_count, device=point.feat.device)
+                if padded_count != point_count:
+                    remainder = point_count % self.patch_size
+                    pad[padded_count - self.patch_size + remainder :] = pad[
+                        padded_count
+                        - 2 * self.patch_size
+                        + remainder : padded_count
+                        - self.patch_size
+                    ]
+                point[pad_key] = pad
+                point[unpad_key] = torch.arange(point_count, device=point.feat.device)
+                point[cu_seqlens_key] = torch.arange(
+                    0,
+                    padded_count + 1,
+                    step=self.patch_size,
+                    dtype=torch.int32,
+                    device=point.feat.device,
+                )
+                return (
+                    point[pad_key],
+                    point[unpad_key],
+                    point[cu_seqlens_key],
+                )
             offset = point.offset
             bincount = offset2bincount(offset)
             bincount_pad = (
@@ -648,15 +746,84 @@ class VanillaSerializedAttention(VanillaPointModule):
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward(self, point):
-        self.patch_size = min(
-            offset2bincount(point.offset).min().tolist(), self.patch_size_max
-        )
+        if "static_attention_order" in point:
+            H = self.num_heads
+            C = self.channels
+            order = point.static_attention_order[self.order_index]
+            inverse = point.static_attention_inverse[self.order_index]
+            qkv = self.qkv(point.feat)[order]
+            q, k, v = qkv.reshape(-1, 3, H, C // H).unbind(dim=1)
+            input_dtype = q.dtype
+            q, k, v = q.half(), k.half(), v.half()
+            feat = torch.ops.aten._flash_attention_forward(
+                q,
+                k,
+                v,
+                point.static_attention_cu_seqlens,
+                point.static_attention_cu_seqlens,
+                point.static_attention_max_sequence,
+                point.static_attention_max_sequence,
+                self.attn_drop_p if self.training else 0.0,
+                False,
+                False,
+                scale=self.scale,
+                seqused_k=point.static_attention_used_keys,
+            )[0]
+            feat = feat.to(input_dtype).reshape(-1, C)
+            feat = feat[inverse]
+            feat = self.proj(feat)
+            feat = self.proj_drop(feat)
+            point.feat = feat
+            return point
+
+        if point.get("batched_attention", False):
+            # A multi-object batch can have different voxel counts per object,
+            # so forcing one rectangular SDPA patch size changes the larger
+            # objects' attention partition. Varlen FlashAttention consumes the
+            # shared canonical padding plan directly and preserves each
+            # object's one-call patch boundaries.
+            H = self.num_heads
+            C = self.channels
+            self.patch_size = point.attention_patch_size
+            order = point.serialized_order[self.order_index][point.pad]
+            inverse = point.unpad[point.serialized_inverse[self.order_index]]
+            qkv = self.qkv(point.feat)[order]
+            q, k, v = qkv.reshape(-1, 3, H, C // H).unbind(dim=1)
+            input_dtype = q.dtype
+            q, k, v = q.half(), k.half(), v.half()
+            feat = torch.ops.aten._flash_attention_forward(
+                q,
+                k,
+                v,
+                point.cu_seqlens_key,
+                point.cu_seqlens_key,
+                self.patch_size,
+                self.patch_size,
+                self.attn_drop_p if self.training else 0.0,
+                False,
+                False,
+                scale=self.scale,
+            )[0]
+            feat = feat.to(input_dtype).reshape(-1, C)
+            feat = feat[inverse]
+            feat = self.proj(feat)
+            feat = self.proj_drop(feat)
+            point.feat = feat
+            return point
+
+        if point.offset.numel() == 1:
+            # ``shape[0]`` is host metadata, unlike ``Tensor.tolist()`` below.
+            self.patch_size = min(point.feat.shape[0], self.patch_size_max)
+        else:
+            self.patch_size = min(
+                offset2bincount(point.offset).min().tolist(), self.patch_size_max
+            )
 
         H = self.num_heads
         K = self.patch_size
         C = self.channels
 
-        pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
+        pad, unpad, _cu_seqlens = self.get_padding_and_inverse(point)
 
         order = point.serialized_order[self.order_index][pad]
         inverse = unpad[point.serialized_inverse[self.order_index]]
@@ -746,7 +913,14 @@ class VanillaEmbedding(VanillaPointModule):
         self.act = act_layer() if act_layer is not None else None
 
     def forward(self, point: VanillaPoint):
-        point.feat = self.conv(point.feat, point.grid_coord, point.batch)
+        topology_key = f"sparse_neighbor_map_k{self.conv.kernel_size}"
+        neighbor_map = point.get(topology_key, None)
+        point.feat = self.conv(
+            point.feat,
+            point.grid_coord,
+            point.batch,
+            neighbor_map=neighbor_map,
+        )
         if self.norm is not None:
             point.feat = self.norm(point.feat)
         if self.act is not None:
@@ -813,12 +987,61 @@ class VanillaBlock(VanillaPointModule):
             drop=proj_drop,
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self._folded_cpe_key = None
+        self._folded_cpe_weight = None
+        self._folded_cpe_bias = None
+
+    def _get_folded_cpe(self):
+        """Fold the consecutive sparse-conv and dense-linear transforms."""
+        key = (
+            self.cpe_conv.weight._version,
+            self.cpe_conv.bias._version,
+            self.cpe_linear.weight._version,
+            self.cpe_linear.bias._version,
+            self.cpe_conv.weight.device,
+            self.cpe_conv.weight.dtype,
+        )
+        if key != self._folded_cpe_key:
+            with torch.no_grad():
+                linear_weight_t = self.cpe_linear.weight.t()
+                self._folded_cpe_weight = (
+                    self.cpe_conv.weight.flatten(0, 1) @ linear_weight_t
+                ).contiguous()
+                self._folded_cpe_bias = (
+                    self.cpe_conv.bias @ linear_weight_t + self.cpe_linear.bias
+                ).contiguous()
+            self._folded_cpe_key = key
+        return self._folded_cpe_weight, self._folded_cpe_bias
 
     def forward(self, point: VanillaPoint):
         # CPE
         shortcut = point.feat
-        cpe_out = self.cpe_conv(point.feat, point.grid_coord, point.batch)
-        cpe_out = self.cpe_linear(cpe_out)
+        topology_key = f"sparse_neighbor_map_k{self.cpe_conv.kernel_size}"
+        if topology_key not in point:
+            point[topology_key] = self.cpe_conv.build_neighbor_map(
+                point.grid_coord, point.batch
+            )
+        fold_cpe = (
+            not torch.is_grad_enabled() and not self.training and point.feat.is_cuda
+        )
+        if fold_cpe:
+            folded_weight, folded_bias = self._get_folded_cpe()
+            cpe_out = self.cpe_conv(
+                point.feat,
+                point.grid_coord,
+                point.batch,
+                neighbor_map=point[topology_key],
+                fused_weight=folded_weight,
+                fused_bias=folded_bias,
+            )
+        else:
+            cpe_out = self.cpe_conv(
+                point.feat,
+                point.grid_coord,
+                point.batch,
+                neighbor_map=point[topology_key],
+            )
+            cpe_out = self.cpe_linear(cpe_out)
         cpe_out = self.cpe_norm(cpe_out)
         point.feat = shortcut + cpe_out
 
@@ -869,7 +1092,8 @@ class VanillaSerializedPooling(VanillaPointModule):
         self.norm = norm_layer(out_channels) if norm_layer is not None else None
         self.act = act_layer() if act_layer is not None else None
 
-    def forward(self, point: VanillaPoint):
+    def build_topology(self, point: VanillaPoint, *, shuffle_orders=None):
+        """Build the feature-independent pooling plan for one stage."""
         pooling_depth = (math.ceil(self.stride) - 1).bit_length()
         if pooling_depth > point.serialized_depth:
             pooling_depth = 0
@@ -881,22 +1105,43 @@ class VanillaSerializedPooling(VanillaPointModule):
         }.issubset(point.keys())
 
         code = point.serialized_code >> pooling_depth * 3
-        code_, cluster, counts = torch.unique(
-            code[0],
-            sorted=True,
-            return_inverse=True,
-            return_counts=True,
-        )
-        _, indices = torch.sort(cluster)
-        idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
+        if shuffle_orders is None:
+            shuffle_orders = self.shuffle_orders
+        if shuffle_orders is False:
+            # In canonical one-object inference, the first serialized order is
+            # already sorted by the full-resolution code. Right-shifting keeps
+            # equal parent voxels consecutive, eliminating unique's inverse
+            # construction and the subsequent cluster sort.
+            indices = point.serialized_order[0]
+            sorted_parent_code = code[0, indices]
+            _, counts = torch.unique_consecutive(sorted_parent_code, return_counts=True)
+            idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
+            segment_ids = torch.searchsorted(
+                idx_ptr[1:],
+                torch.arange(indices.shape[0], device=indices.device),
+                right=True,
+            )
+            cluster = torch.empty_like(indices).scatter_(0, indices, segment_ids)
+        else:
+            _, cluster, counts = torch.unique(
+                code[0],
+                sorted=True,
+                return_inverse=True,
+                return_counts=True,
+            )
+            _, indices = torch.sort(cluster)
+            idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
+            segment_ids = torch.arange(
+                counts.shape[0], device=counts.device
+            ).repeat_interleave(counts)
         head_indices = indices[idx_ptr[:-1]]
 
-        # Aggregate features and coordinates using pure PyTorch
-        proj_feat = self.proj(point.feat)
-        pooled_feat = segment_csr_vanilla(
-            proj_feat[indices], idx_ptr, reduce=self.reduce
+        pooled_coord = segment_ids_vanilla(
+            point.coord[indices],
+            segment_ids,
+            counts.shape[0],
+            reduce="mean",
         )
-        pooled_coord = segment_csr_vanilla(point.coord[indices], idx_ptr, reduce="mean")
 
         # Generate down code, order, inverse
         code = code[:, head_indices]
@@ -909,14 +1154,13 @@ class VanillaSerializedPooling(VanillaPointModule):
             ),
         )
 
-        if self.shuffle_orders:
+        if shuffle_orders:
             perm = torch.randperm(code.shape[0])
             code = code[perm]
             order = order[perm]
             inverse = inverse[perm]
 
         point_dict = Dict(
-            feat=pooled_feat,
             coord=pooled_coord,
             grid_coord=point.grid_coord[head_indices] >> pooling_depth,
             serialized_code=code,
@@ -926,10 +1170,45 @@ class VanillaSerializedPooling(VanillaPointModule):
             batch=point.batch[head_indices],
         )
 
-        if "condition" in point.keys():
+        if "condition" in point:
             point_dict["condition"] = point.condition
-        if "context" in point.keys():
+        if "context" in point:
             point_dict["context"] = point.context
+
+        return point_dict, indices, idx_ptr, cluster, segment_ids
+
+    def forward(self, point: VanillaPoint):
+        topology_stages = point.get("_topology_stages", None)
+        if topology_stages is None:
+            point_dict, indices, idx_ptr, cluster, _ = self.build_topology(point)
+        else:
+            stage_index = point["_topology_stage_index"]
+            current_topology = topology_stages[stage_index]
+            indices = current_topology["pool_indices"]
+            idx_ptr = current_topology["pool_idx_ptr"]
+            cluster = current_topology["pool_cluster"]
+            segment_ids = current_topology["pool_segment_ids"]
+            num_segments = current_topology["pool_num_segments"]
+            point_dict = Dict(topology_stages[stage_index + 1])
+            point_dict["_topology_stages"] = topology_stages
+            point_dict["_topology_stage_index"] = stage_index + 1
+
+        # Projection is branch-specific; the sort, segment pointers, and all
+        # output geometry above are shared by the two independently weighted
+        # encoders.
+        proj_feat = self.proj(point.feat)
+        sorted_feat = proj_feat[indices]
+        if topology_stages is None:
+            point_dict["feat"] = segment_csr_vanilla(
+                sorted_feat, idx_ptr, reduce=self.reduce
+            )
+        else:
+            point_dict["feat"] = segment_ids_vanilla(
+                sorted_feat,
+                segment_ids,
+                num_segments,
+                reduce=self.reduce,
+            )
 
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
@@ -1075,7 +1354,109 @@ class PointTransformerV3Vanilla(nn.Module):
         else:
             self.projection = nn.Identity()
 
-    def forward(self, data_dict):
+    @torch.inference_mode()
+    def build_single_object_topology(self, data_dict):
+        """Build a canonical geometry plan shared by both encoders.
+
+        PTV3 serialization, voxel pooling, sparse-neighbor maps, and attention
+        patch layouts depend only on object coordinates.  The released model
+        redundantly builds all of them for the generator and discriminator.
+        This plan uses the canonical serialization ordering (no inference-time
+        order shuffle) and can be consumed by either set of weights. The
+        deployed native path remains single-object; this dynamic eager plan also
+        supports a true multi-object batch.
+        """
+        point = VanillaPoint(data_dict)
+        if point.offset.numel() < 1:
+            raise ValueError("shared PTV3 topology requires at least one object")
+        object_count = point.offset.numel()
+        point.serialization(order=self.order, shuffle_orders=False)
+        topology_stages = []
+
+        for stage_index in range(self.num_stages):
+            enc_stage = self.enc._modules[f"enc{stage_index}"]
+            first_block = enc_stage._modules["block0"]
+
+            topology = {
+                key: point[key]
+                for key in (
+                    "coord",
+                    "grid_coord",
+                    "serialized_code",
+                    "serialized_order",
+                    "serialized_inverse",
+                    "serialized_depth",
+                    "batch",
+                    "offset",
+                )
+            }
+            if stage_index == 0:
+                topology["sparse_neighbor_map_k5"] = (
+                    self.embedding.conv.build_neighbor_map(
+                        point.grid_coord,
+                        point.batch,
+                    )
+                )
+            topology["sparse_neighbor_map_k3"] = (
+                first_block.cpe_conv.build_neighbor_map(
+                    point.grid_coord,
+                    point.batch,
+                )
+            )
+
+            # All blocks in a stage share point count and maximum patch size,
+            # so their padding maps are identical.
+            if object_count == 1:
+                first_block.attn.patch_size = min(
+                    point.feat.shape[0], first_block.attn.patch_size_max
+                )
+            else:
+                first_block.attn.patch_size = min(
+                    int(offset2bincount(point.offset).max().item()),
+                    first_block.attn.patch_size_max,
+                )
+            pad, unpad, cu_seqlens = first_block.attn.get_padding_and_inverse(point)
+            topology["pad"] = pad
+            topology["unpad"] = unpad
+            topology["cu_seqlens_key"] = cu_seqlens
+            if object_count > 1:
+                topology["batched_attention"] = True
+                topology["attention_patch_size"] = first_block.attn.patch_size
+            topology_stages.append(topology)
+
+            if stage_index + 1 < self.num_stages:
+                next_stage = self.enc._modules[f"enc{stage_index + 1}"]
+                pooling = next_stage._modules["down"]
+                (
+                    point_dict,
+                    indices,
+                    idx_ptr,
+                    cluster,
+                    segment_ids,
+                ) = pooling.build_topology(point, shuffle_orders=False)
+                topology["pool_indices"] = indices
+                topology["pool_idx_ptr"] = idx_ptr
+                topology["pool_cluster"] = cluster
+                topology["pool_segment_ids"] = segment_ids
+                topology["pool_num_segments"] = idx_ptr.shape[0] - 1
+                if object_count == 1:
+                    point_count = point_dict.serialized_code.shape[1]
+                    point_dict["offset"] = torch.full(
+                        (1,),
+                        point_count,
+                        dtype=torch.long,
+                        device=point.grid_coord.device,
+                    )
+                else:
+                    point_dict["offset"] = batch2offset(point_dict.batch)
+                # Only point-count metadata is needed before the next stage's
+                # branch-specific projected feature tensor exists.
+                point_dict["feat"] = point_dict.coord
+                point = VanillaPoint(point_dict)
+
+        return tuple(topology_stages)
+
+    def forward(self, data_dict, topology_stages=None):
         """
         Args:
             data_dict: Dictionary with keys "feat", "coord", "grid_size",
@@ -1084,17 +1465,36 @@ class PointTransformerV3Vanilla(nn.Module):
         Returns:
             Tensor of shape (B, output_dim).
         """
-        point = VanillaPoint(data_dict)
-        point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        if topology_stages is None:
+            point = VanillaPoint(data_dict)
+            point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        else:
+            if len(topology_stages) != self.num_stages:
+                raise ValueError("PTV3 topology stage count does not match encoder")
+            point_dict = Dict(topology_stages[0])
+            point_dict["feat"] = data_dict["feat"]
+            point_dict["_topology_stages"] = topology_stages
+            point_dict["_topology_stage_index"] = 0
+            point = VanillaPoint(point_dict)
 
         point = self.embedding(point)
         point = self.enc(point)
 
         # Global mean pool per batch item → (B, enc_channels[-1])
-        pooled = segment_csr_vanilla(
-            point.feat,
-            F.pad(point.offset, (1, 0)),
-            reduce="mean",
-        )
+        if topology_stages is not None:
+            if topology_stages[-1]["offset"].numel() == 1:
+                pooled = point.feat.mean(dim=0, keepdim=True)
+            else:
+                pooled = segment_csr_vanilla(
+                    point.feat,
+                    F.pad(topology_stages[-1]["offset"], (1, 0)),
+                    reduce="mean",
+                )
+        else:
+            pooled = segment_csr_vanilla(
+                point.feat,
+                F.pad(point.offset, (1, 0)),
+                reduce="mean",
+            )
 
         return self.projection(pooled)
