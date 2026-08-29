@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -168,6 +170,16 @@ def onnx_summary(path):
 
 
 def tensorrt_parse_summary(path):
+    if platform.machine() == "aarch64":
+        version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        for package_path in reversed(
+            (
+                Path(f"/usr/lib/python{version}/dist-packages"),
+                Path("/usr/lib/python3/dist-packages"),
+            )
+        ):
+            if package_path.is_dir() and str(package_path) not in sys.path:
+                sys.path.insert(0, str(package_path))
     try:
         import tensorrt as trt
     except ModuleNotFoundError:

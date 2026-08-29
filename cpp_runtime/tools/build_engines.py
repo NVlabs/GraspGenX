@@ -8,7 +8,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import sys
 from pathlib import Path
+
+if platform.machine() == "aarch64":
+    _version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    for _path in reversed(
+        (
+            Path(f"/usr/lib/python{_version}/dist-packages"),
+            Path("/usr/lib/python3/dist-packages"),
+        )
+    ):
+        if _path.is_dir() and str(_path) not in sys.path:
+            sys.path.insert(0, str(_path))
 
 try:
     import tensorrt as trt

@@ -40,14 +40,8 @@ def test_fast_inference_selects_cuda13_dependencies():
     assert (
         "\"tensorrt-cu13-libs==10.13.3.9; platform_machine != 'aarch64'\"" in pyproject
     )
-    assert (
-        "\"tensorrt-cu13-bindings>=10.16,<10.17; platform_machine == 'aarch64'\""
-        in pyproject
-    )
-    assert (
-        "\"tensorrt-cu13-libs>=10.16,<10.17; platform_machine == 'aarch64'\""
-        in pyproject
-    )
+    assert "tensorrt-cu13-bindings>=10.16" not in pyproject
+    assert "tensorrt-cu13-libs>=10.16" not in pyproject
     assert '"nvidia-cuda-runtime-cu13"' in pyproject
     assert '"torchvision>=0.16"' in pyproject
 

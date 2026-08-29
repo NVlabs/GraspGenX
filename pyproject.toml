@@ -64,15 +64,12 @@ fast-inference = [
     "torch>=2.9",
     "cmake>=3.24",
     "ninja>=1.11",
-    # Install the matching TensorRT shared libraries as well as Python bindings.
-    # Jetson Orin needs TensorRT 10.16 for SM 8.7; x86 keeps the 10.13 runtime
-    # used for the released RTX 5090 benchmarks. The bindings-only wheels cannot
-    # import without their matching libnvonnxparser.so.10 libraries.
+    # x86 uses the 10.13 runtime from the released RTX 5090 benchmarks. Jetson
+    # uses JetPack's system TensorRT Python package so plan generation and the
+    # native C++ runtime always use the exact same TensorRT patch version.
     "nvidia-cuda-runtime>=13",
     "tensorrt-cu13-bindings==10.13.3.9; platform_machine != 'aarch64'",
     "tensorrt-cu13-libs==10.13.3.9; platform_machine != 'aarch64'",
-    "tensorrt-cu13-bindings>=10.16,<10.17; platform_machine == 'aarch64'",
-    "tensorrt-cu13-libs>=10.16,<10.17; platform_machine == 'aarch64'",
     "ml-dtypes==0.5.4; python_version < '3.13'",
     "onnx==1.21.0; python_version < '3.13'",
     "onnxscript==0.7.1; python_version < '3.13'",

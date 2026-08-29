@@ -120,7 +120,9 @@ plans. Add `--force-artifacts` as well when rebuilding existing plans.
 
 The host still needs a CUDA toolkit with `nvcc` and matching TensorRT runtime
 and development headers (`libnvinfer` and `NvInfer.h`). For a nonstandard CUDA
-or TensorRT installation, pass `--cuda-root` or `--tensorrt-root`.
+or TensorRT installation, pass `--cuda-root` or `--tensorrt-root`. On Jetson,
+the installer uses JetPack's system TensorRT Python package so plan generation
+matches the native TensorRT runtime exactly.
 
 Inside an existing conda or Python environment, use `pip install -e .` for
 PyTorch inference. Use the uv commands above for the complete native runtime;

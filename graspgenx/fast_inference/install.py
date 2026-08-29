@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -21,6 +22,21 @@ from graspgenx.fast_inference.cpp_runtime import required_runtime_artifacts
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CPP_RUNTIME = _ROOT / "cpp_runtime"
+
+
+def _prefer_jetson_system_packages() -> None:
+    """Expose JetPack Python packages inside uv's isolated aarch64 venv."""
+    if platform.machine() != "aarch64":
+        return
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = (
+        Path(f"/usr/lib/python{version}/dist-packages"),
+        Path("/usr/lib/python3/dist-packages"),
+    )
+    for path in reversed(candidates):
+        value = str(path)
+        if path.is_dir() and value not in sys.path:
+            sys.path.insert(0, value)
 
 
 def _default_release_root() -> Path:
@@ -233,6 +249,7 @@ def _cmake_commands(args, cmake: str) -> list[list[str]]:
 
 
 def _import_build_dependencies():
+    _prefer_jetson_system_packages()
     missing = []
     for module in ("onnx", "onnxscript"):
         try:
