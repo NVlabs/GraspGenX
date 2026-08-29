@@ -19,7 +19,8 @@ from pathlib import Path
 
 import torch
 
-MIN_OBJECT_POINT_COUNT = 100
+from graspgenx._constants import MIN_OBJECT_POINT_COUNT
+
 ENGINE_POINT_COUNT = 3500
 _ROOT = Path(__file__).resolve().parents[2]
 _LIBRARY_ENV = "GRASPGENX_CPP_RUNTIME_LIBRARY"
@@ -443,7 +444,6 @@ def encode_gripper_embeddings(
 
 __all__ = [
     "ENGINE_POINT_COUNT",
-    "MIN_OBJECT_POINT_COUNT",
     "NativeCppRuntime",
     "NativeGripperEmbeddings",
     "NativeInferenceResult",

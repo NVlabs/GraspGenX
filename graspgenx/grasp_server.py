@@ -8,14 +8,14 @@ import numpy as np
 import omegaconf
 import torch
 
+from graspgenx._constants import MIN_OBJECT_POINT_COUNT
 from graspgenx.batching import collate
-from graspgenx.inference.preprocessing import (
-    MIN_OBJECT_POINT_COUNT,
-    filter_and_resample_point_cloud,
-)
 from graspgenx.models.grasp_gen import GraspGen
 from graspgenx.utils.logging_config import get_logger
-from graspgenx.utils.point_cloud import resample_point_cloud_fixed
+from graspgenx.utils.point_cloud import (
+    filter_and_resample_point_cloud,
+    resample_point_cloud_fixed,
+)
 from graspgenx.x_grippers import (
     XGripperInfo,
     make_sweep_volume_gripper_info,

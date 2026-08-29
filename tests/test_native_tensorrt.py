@@ -17,9 +17,9 @@ from cpp_runtime.tools.artifact_tools import (
     inference_timesteps,
     normal_sobol_samples,
 )
+from graspgenx._constants import MIN_OBJECT_POINT_COUNT
 from graspgenx.fast_inference import DEFAULT_DDPM_INFERENCE_STEPS
 from graspgenx.fast_inference.cpp_runtime import (
-    MIN_OBJECT_POINT_COUNT,
     NativeCppRuntime,
     NativeGripperEmbeddings,
     resolve_artifact_directory,

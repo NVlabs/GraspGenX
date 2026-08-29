@@ -1,7 +1,13 @@
+import numpy as np
 import pytest
 import torch
-import numpy as np
-from graspgenx.utils.point_cloud import knn_points, point_cloud_outlier_removal
+
+from graspgenx._constants import MIN_OBJECT_POINT_COUNT
+from graspgenx.utils.point_cloud import (
+    filter_and_resample_point_cloud,
+    knn_points,
+    point_cloud_outlier_removal,
+)
 
 
 def test_knn_points_basic():
@@ -141,3 +147,20 @@ def test_point_cloud_outlier_removal_returns_correct_shapes():
     assert filtered_pc.shape[1] == 3
     assert removed_pc.ndim == 2
     assert removed_pc.shape[1] == 3
+
+
+def test_filter_and_resample_point_cloud_returns_fixed_count():
+    points = torch.zeros(MIN_OBJECT_POINT_COUNT, 3)
+
+    output = filter_and_resample_point_cloud(points, num_points=128)
+
+    assert output.shape == (128, 3)
+    assert torch.equal(output, torch.zeros(128, 3))
+
+
+def test_filter_and_resample_point_cloud_enforces_minimum_count():
+    with pytest.raises(ValueError, match=f"at least {MIN_OBJECT_POINT_COUNT}"):
+        filter_and_resample_point_cloud(
+            torch.zeros(MIN_OBJECT_POINT_COUNT - 1, 3),
+            num_points=128,
+        )

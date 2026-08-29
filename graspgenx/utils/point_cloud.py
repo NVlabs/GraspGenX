@@ -11,6 +11,7 @@ import trimesh
 import trimesh.transformations as tra
 from tqdm import tqdm
 
+from graspgenx._constants import MIN_OBJECT_POINT_COUNT
 from graspgenx.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -94,6 +95,31 @@ def resample_point_cloud_fixed(
     else:
         input_indices = output_indices.remainder(count)
     return obj_pc[input_indices]
+
+
+def filter_and_resample_point_cloud(
+    obj_pc: torch.Tensor,
+    *,
+    num_points: int = 3500,
+    threshold: float = 0.014,
+) -> torch.Tensor:
+    """Filter outliers and return exactly ``num_points`` rows.
+
+    This path uses PyTorch operations on either CPU or CUDA. The native runtime
+    owns its separately compiled fixed-shape CUDA preprocessing.
+    """
+    if obj_pc.ndim != 2 or obj_pc.shape[1] != 3:
+        raise ValueError(f"expected point cloud [N,3], got {tuple(obj_pc.shape)}")
+    if obj_pc.shape[0] < MIN_OBJECT_POINT_COUNT:
+        raise ValueError(
+            f"GraspGenX requires at least {MIN_OBJECT_POINT_COUNT} object "
+            f"points; received {obj_pc.shape[0]}"
+        )
+    obj_pc = obj_pc.float().contiguous()
+    filtered, _ = point_cloud_outlier_removal(obj_pc, threshold=threshold)
+    if len(filtered) < 10:
+        filtered = obj_pc
+    return resample_point_cloud_fixed(filtered, num_points)
 
 
 def depth2points(

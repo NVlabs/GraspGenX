@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 from pathlib import Path
 
 from graspgenx.fast_inference.cpp_runtime import required_runtime_artifacts
@@ -12,13 +13,11 @@ from graspgenx.fast_inference.install import (
 )
 
 
-def test_pytorch_and_fast_inference_have_separate_public_namespaces():
+def test_native_runtime_has_one_public_namespace():
     from graspgenx import fast_inference
-    from graspgenx import inference as pytorch_inference
 
     assert hasattr(fast_inference, "install_fast_runtime")
-    assert not hasattr(pytorch_inference, "install_fast_runtime")
-    assert not hasattr(pytorch_inference, "DEFAULT_DDPM_INFERENCE_STEPS")
+    assert importlib.util.find_spec("graspgenx.inference") is None
 
 
 def _touch_artifacts(directory: Path, steps=20, diffusion=100, obb=50):
