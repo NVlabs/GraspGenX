@@ -9,7 +9,6 @@ import os
 
 import torch
 
-from graspgenx.fast_inference._constants import DEFAULT_DDPM_INFERENCE_STEPS
 from graspgenx.fast_inference.cpp_runtime import NativeCppRuntime
 from graspgenx.utils.logging_config import get_logger
 
@@ -43,11 +42,11 @@ def _offload_native_replacements(model) -> int:
 def install_fast_runtime(
     sampler,
     *,
-    diffusion_steps: int = DEFAULT_DDPM_INFERENCE_STEPS,
     diffusion_grasps: int = 100,
     obb_grasps: int = 50,
     artifact_directory: str | os.PathLike[str] | None = None,
     library_path: str | os.PathLike[str] | None = None,
+    denoiser: str = "ddpm",
 ) -> bool:
     """Attach the native fast-inference implementation.
 
@@ -57,14 +56,13 @@ def install_fast_runtime(
     copied into the shared runtime on the caller stream.
     """
     model = sampler.model
-    diffusion_steps = int(diffusion_steps)
     diffusion_grasps = int(diffusion_grasps)
     obb_grasps = int(obb_grasps)
     existing = getattr(model, "native_cpp_runtime", None)
     if existing is not None:
-        requested = (diffusion_steps, diffusion_grasps, obb_grasps)
+        requested = (denoiser, diffusion_grasps, obb_grasps)
         active = (
-            existing.diffusion_steps,
+            getattr(existing, "denoiser", "ddpm"),
             existing.diffusion_grasps,
             existing.obb_grasps,
         )
@@ -79,9 +77,9 @@ def install_fast_runtime(
         runtime = NativeCppRuntime(
             artifact_directory=artifact_directory,
             library_path=library_path,
-            diffusion_steps=diffusion_steps,
             diffusion_grasps=diffusion_grasps,
             obb_grasps=obb_grasps,
+            denoiser=denoiser,
             device=generator_device,
         )
     except Exception as error:  # noqa: BLE001 - eager fallback remains intact
@@ -91,7 +89,7 @@ def install_fast_runtime(
     model.native_cpp_runtime = runtime
     model.optimized_diffusion_grasps = diffusion_grasps
     model.optimized_obb_grasps = obb_grasps
-    model.grasp_generator.num_diffusion_iters_eval = diffusion_steps
+    model.grasp_generator.num_diffusion_iters_eval = runtime.denoising_steps
     model.grasp_generator.num_grasps_per_object = diffusion_grasps
     try:
         released_bytes = _offload_native_replacements(model)
@@ -100,9 +98,10 @@ def install_fast_runtime(
         logger.warning("Could not offload C++-replaced PyTorch weights: %s", error)
     torch.cuda.empty_cache()
     logger.info(
-        "Native C++ TensorRT/CUDA runtime enabled (%d DDPM steps, %d diffusion "
+        "Native C++ TensorRT/CUDA runtime enabled (%s%d, %d diffusion "
         "+ %d OBB grasps, %.1f MiB PyTorch weights offloaded)",
-        diffusion_steps,
+        denoiser.upper(),
+        runtime.denoising_steps,
         diffusion_grasps,
         obb_grasps,
         released_bytes / (1 << 20),

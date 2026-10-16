@@ -7,11 +7,9 @@ from __future__ import annotations
 
 import torch
 
-DDPM_TIMESTEP_PRESETS = {
-    5: (19, 8, 5, 3, 0),
-    10: (19, 17, 15, 13, 11, 8, 6, 4, 2, 0),
-    20: tuple(range(19, -1, -1)),
-}
+from graspgenx.fast_inference._constants import denoising_steps
+
+_DENOISER_TIMESTEPS = {"ddpm": tuple(range(19, -1, -1))}
 
 _COEFFICIENT_NAMES = (
     "sample_to_original",
@@ -61,27 +59,28 @@ def fold_attention(head: torch.nn.Module):
     return folded
 
 
-def inference_timesteps(generator: torch.nn.Module, inference_steps: int | None = None):
-    """Return one of the validated deployment schedules."""
+def inference_timesteps(
+    generator: torch.nn.Module,
+    *,
+    denoiser: str = "ddpm",
+):
+    """Return the fixed deployment schedule selected by the denoiser."""
     train_steps = int(generator.num_diffusion_iters)
-    inference_steps = int(
-        generator.num_diffusion_iters_eval
-        if inference_steps is None
-        else inference_steps
-    )
-    preset = DDPM_TIMESTEP_PRESETS.get(inference_steps)
-    if preset is None or preset[0] != train_steps - 1:
-        choices = ", ".join(str(value) for value in DDPM_TIMESTEP_PRESETS)
+    step_count = denoising_steps(denoiser)
+    preset = _DENOISER_TIMESTEPS[denoiser]
+    if len(preset) != step_count or preset[0] != train_steps - 1:
         raise ValueError(
-            f"inference_steps must be one of {choices}; got {inference_steps}"
+            f"{denoiser} schedule is incompatible with {train_steps} training steps"
         )
     return torch.tensor(preset, dtype=torch.int64)
 
 
 def scheduler_coefficients(
-    generator: torch.nn.Module, inference_steps: int | None = None
+    generator: torch.nn.Module,
+    *,
+    denoiser: str = "ddpm",
 ):
-    """Return timestep and generalized-DDPM transition coefficient tables."""
+    """Return fixed DDPM20 transition coefficients."""
     if not generator.compositional_schedular:
         raise ValueError("native artifacts require compositional_schedular=True")
     if generator.output_dim != 6:
@@ -89,7 +88,7 @@ def scheduler_coefficients(
 
     pos = generator.noise_scheduler_pos
     rot = generator.noise_scheduler_rot
-    timesteps = inference_timesteps(generator, inference_steps)
+    timesteps = inference_timesteps(generator, denoiser=denoiser)
     rows = []
     likelihood_betas = []
     for step_index, timestep_tensor in enumerate(timesteps):
@@ -173,7 +172,6 @@ def scheduler_coefficients(
 
 
 __all__ = [
-    "DDPM_TIMESTEP_PRESETS",
     "fold_attention",
     "inference_timesteps",
     "normal_sobol_samples",

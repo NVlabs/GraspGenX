@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 
 from graspgenx._constants import MIN_OBJECT_POINT_COUNT
+from graspgenx.fast_inference._constants import artifact_subdirectory, denoising_steps
 
 ENGINE_POINT_COUNT = 3500
 _ROOT = Path(__file__).resolve().parents[2]
@@ -28,11 +29,12 @@ _LIBRARY_ENV = "GRASPGENX_CPP_RUNTIME_LIBRARY"
 _ARTIFACT_ENV = "GRASPGENX_CPP_RUNTIME_ARTIFACTS"
 
 
-class _Config(ctypes.Structure):
+class _ConfigV2(ctypes.Structure):
     _fields_ = [
+        ("struct_size", ctypes.c_size_t),
         ("artifact_directory", ctypes.c_char_p),
         ("initial_gripper_depth", ctypes.c_float),
-        ("diffusion_steps", ctypes.c_int),
+        ("denoiser_type", ctypes.c_int),
         ("diffusion_grasps", ctypes.c_int),
         ("obb_grasps", ctypes.c_int),
     ]
@@ -75,24 +77,26 @@ def resolve_artifact_directory(
     *,
     diffusion_grasps: int,
     obb_grasps: int,
-    diffusion_steps: int = 20,
+    denoiser: str = "ddpm",
 ) -> Path:
+    step_count = denoising_steps(denoiser)
     value = artifact_directory or os.environ.get(_ARTIFACT_ENV)
     directory = (
         Path(value).expanduser()
         if value is not None
-        else _ROOT / "cpp_runtime/artifacts"
+        else _ROOT / "cpp_runtime/artifacts" / artifact_subdirectory(denoiser)
     ).resolve()
     required = required_runtime_artifacts(
         directory,
-        diffusion_steps=diffusion_steps,
         diffusion_grasps=diffusion_grasps,
         obb_grasps=obb_grasps,
+        denoiser=denoiser,
     )
     missing = [path for path in required if not path.is_file()]
     if missing:
         requested = (int(diffusion_grasps), int(obb_grasps))
-        available = _available_runtime_domains(directory, int(diffusion_steps))
+        denoiser_label = denoiser.upper()
+        available = _available_runtime_domains(directory, denoiser)
         available_text = (
             ", ".join(
                 f"{diffusion} diffusion + {obb} OBB" for diffusion, obb in available
@@ -107,12 +111,12 @@ def resolve_artifact_directory(
         )
         raise FileNotFoundError(
             f"Native GraspGenX {issue}. Requested domain: "
-            f"{int(diffusion_steps)} DDPM steps, {requested[0]} diffusion + "
+            f"{step_count} {denoiser_label} steps, {requested[0]} diffusion + "
             f"{requested[1]} OBB grasps ({sum(requested)} total candidates). "
-            f"Available complete domains for {int(diffusion_steps)} DDPM steps: "
+            f"Available complete domains for {step_count} {denoiser_label} steps: "
             f"{available_text}. Build the requested domain with "
             "`uv run --quiet --extra fast-inference graspgenx-install-fast-inference "
-            f"--diffusion-steps {int(diffusion_steps)} "
+            f"--denoiser {denoiser} "
             f"--diffusion-grasps {requested[0]} --obb-grasps {requested[1]}`. "
             f"Artifact directory: {directory}. Missing: "
             f"{[str(path) for path in missing]}"
@@ -123,15 +127,15 @@ def resolve_artifact_directory(
 def required_runtime_artifacts(
     directory: str | os.PathLike[str],
     *,
-    diffusion_steps: int,
     diffusion_grasps: int,
     obb_grasps: int,
+    denoiser: str = "ddpm",
 ) -> tuple[Path, ...]:
     """Return every count- and schedule-specific file consumed by C++."""
     directory = Path(directory)
     engines = directory / "engines"
     weights = directory / "weights"
-    schedule = weights / "schedules" / str(int(diffusion_steps))
+    schedule = weights / "schedules" / str(denoising_steps(denoiser))
     ptv3_plans = tuple(
         engines / "ptv3" / f"ptv3_{branch}_stage{stage}_fp16.plan"
         for branch in ("generator", "discriminator")
@@ -148,7 +152,7 @@ def required_runtime_artifacts(
         weights / "prediction_bias.bin",
         weights / f"sobol_initial_sample_d{int(diffusion_grasps)}.bin",
         schedule / "timestep_conditioning.bin",
-        schedule / "ddpm_coefficients.bin",
+        schedule / "denoising_coefficients.bin",
     )
 
 
@@ -158,7 +162,7 @@ _ARTIFACT_REPORT_PATTERN = re.compile(
 
 
 def _available_runtime_domains(
-    directory: Path, diffusion_steps: int
+    directory: Path, denoiser: str = "ddpm"
 ) -> tuple[tuple[int, int], ...]:
     """Return complete fixed-count domains described by artifact reports."""
     domains = set()
@@ -170,9 +174,9 @@ def _available_runtime_domains(
             domain = (int(match["diffusion"]), int(match["obb"]))
             required = required_runtime_artifacts(
                 directory,
-                diffusion_steps=diffusion_steps,
                 diffusion_grasps=domain[0],
                 obb_grasps=domain[1],
+                denoiser=denoiser,
             )
             if all(path.is_file() for path in required):
                 domains.add(domain)
@@ -183,11 +187,11 @@ def _configure_library(library):
     void_p = ctypes.c_void_p
     library.graspgenx_runtime_last_error.argtypes = []
     library.graspgenx_runtime_last_error.restype = ctypes.c_char_p
-    library.graspgenx_runtime_create.argtypes = [
-        ctypes.POINTER(_Config),
+    library.graspgenx_runtime_create_v2.argtypes = [
+        ctypes.POINTER(_ConfigV2),
         ctypes.POINTER(void_p),
     ]
-    library.graspgenx_runtime_create.restype = ctypes.c_int
+    library.graspgenx_runtime_create_v2.restype = ctypes.c_int
     library.graspgenx_runtime_destroy.argtypes = [void_p]
     library.graspgenx_runtime_destroy.restype = None
     library.graspgenx_runtime_device.argtypes = [void_p, ctypes.POINTER(ctypes.c_int)]
@@ -255,17 +259,16 @@ class NativeCppRuntime:
         *,
         artifact_directory: str | os.PathLike[str] | None = None,
         library_path: str | os.PathLike[str] | None = None,
-        diffusion_steps: int = 20,
         diffusion_grasps: int = 100,
         obb_grasps: int = 50,
         device: int | torch.device | None = None,
         seed: int | None = None,
+        denoiser: str = "ddpm",
     ):
-        self.diffusion_steps = int(diffusion_steps)
         self.diffusion_grasps = int(diffusion_grasps)
         self.obb_grasps = int(obb_grasps)
-        if self.diffusion_steps not in (5, 10, 20):
-            raise ValueError("diffusion_steps must be one of 5, 10, or 20")
+        self.denoiser = str(denoiser)
+        self.denoising_steps = denoising_steps(self.denoiser)
         if self.diffusion_grasps < 1:
             raise ValueError("diffusion_grasps must be positive")
         if self.obb_grasps < 0 or self.diffusion_grasps + self.obb_grasps > 4096:
@@ -287,23 +290,24 @@ class NativeCppRuntime:
             )
         self.artifact_directory = resolve_artifact_directory(
             artifact_directory,
-            diffusion_steps=self.diffusion_steps,
             diffusion_grasps=self.diffusion_grasps,
             obb_grasps=self.obb_grasps,
+            denoiser=self.denoiser,
         )
         self.library_path = resolve_runtime_library(library_path)
         self._library = _configure_library(ctypes.CDLL(str(self.library_path)))
         self._handle = ctypes.c_void_p()
-        config = _Config(
+        config = _ConfigV2(
+            ctypes.sizeof(_ConfigV2),
             str(self.artifact_directory).encode(),
             ctypes.c_float(0.1034),
-            self.diffusion_steps,
+            0,
             self.diffusion_grasps,
             self.obb_grasps,
         )
         with torch.cuda.device(device_index):
             self._check(
-                self._library.graspgenx_runtime_create(
+                self._library.graspgenx_runtime_create_v2(
                     ctypes.byref(config), ctypes.byref(self._handle)
                 ),
                 "create native runtime",
@@ -454,7 +458,7 @@ class NativeCppRuntime:
             "native device inference",
         )
         if sequence_offset is None:
-            random_pairs = self.diffusion_steps * self.diffusion_grasps * 3
+            random_pairs = self.denoising_steps * self.diffusion_grasps * 3
             self.sequence_offset = (self.sequence_offset + random_pairs) & (
                 (1 << 64) - 1
             )

@@ -73,8 +73,8 @@ The main acceleration decisions are:
   embeddings are loaded at runtime, so changing grippers does not rebuild the
   large TensorRT engines.
 
-The default sampler uses the released 20-step DDPM trajectory. Tuned 5- and
-10-step schedules remain selectable without changing the engine interface.
+The DDPM sampler uses only the released 20-step trajectory; no step-count
+input is exposed.
 
 ## Runtime boundary
 

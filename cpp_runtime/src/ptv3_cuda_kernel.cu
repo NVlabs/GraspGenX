@@ -1041,7 +1041,7 @@ __global__ void denoise_step_kernel(
   output[sample_index] = static_cast<NativeHalf>(previous);
 }
 
-// Every recurrent boundary except the last consumes the six-value DDPM output
+// Every recurrent boundary except the last consumes the six-value denoiser output
 // immediately in the next 6 -> 512 sample projection. Keeping the rounded
 // FP16 state in shared memory preserves the original arithmetic while removing
 // one launch and one global read from each transition between denoiser steps.

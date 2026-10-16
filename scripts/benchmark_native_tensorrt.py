@@ -21,7 +21,6 @@ import numpy as np
 import torch
 import trimesh
 
-from graspgenx.fast_inference import DEFAULT_DDPM_INFERENCE_STEPS
 from graspgenx.fast_inference.cpp_runtime import (
     NativeCppRuntime,
     NativeGripperEmbeddings,
@@ -56,12 +55,7 @@ def parse_args():
     parser.add_argument("--gripper-depth", type=float, default=0.136)
     parser.add_argument("--diffusion-grasps", type=int, default=100)
     parser.add_argument("--obb-grasps", type=int, default=50)
-    parser.add_argument(
-        "--diffusion-steps",
-        type=int,
-        choices=(5, 10, 20),
-        default=DEFAULT_DDPM_INFERENCE_STEPS,
-    )
+    parser.add_argument("--denoiser", choices=("ddpm",), default="ddpm")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--cycles", type=int, default=30)
     parser.add_argument("--output", type=Path)
@@ -212,9 +206,9 @@ def main():
     runtime = NativeCppRuntime(
         artifact_directory=args.artifacts,
         library_path=args.library,
-        diffusion_steps=args.diffusion_steps,
         diffusion_grasps=args.diffusion_grasps,
         obb_grasps=args.obb_grasps,
+        denoiser=args.denoiser,
     )
     try:
         gripper = _resolve_embeddings(args, runtime.artifact_directory)
@@ -228,7 +222,8 @@ def main():
             "artifact_directory": str(runtime.artifact_directory),
             "execution": "Python CUDA pointers -> C ABI -> C++ CUDA Graph runtime",
             "objects": [name for name, _ in clouds],
-            "diffusion_steps": args.diffusion_steps,
+            "denoising_steps": runtime.denoising_steps,
+            "denoiser": args.denoiser,
             "diffusion_grasps": args.diffusion_grasps,
             "obb_grasps": args.obb_grasps,
             "warmup": args.warmup,

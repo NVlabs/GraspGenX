@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(_WIN32)
@@ -16,6 +17,10 @@ extern "C" {
 
 typedef void* graspgenx_runtime_handle;
 
+enum {
+  GRASPGENX_DENOISER_DDPM = 0,
+};
+
 typedef struct graspgenx_runtime_c_config {
   const char* artifact_directory;
   float initial_gripper_depth;
@@ -24,11 +29,27 @@ typedef struct graspgenx_runtime_c_config {
   int obb_grasps;
 } graspgenx_runtime_c_config;
 
+// Size-tagged extension that adds denoiser selection without changing the
+// original C ABI. The denoiser selects its fixed step count: DDPM20.
+// graspgenx_runtime_create() continues to select DDPM20 and validates the
+// legacy diffusion_steps field.
+typedef struct graspgenx_runtime_c_config_v2 {
+  size_t struct_size;
+  const char* artifact_directory;
+  float initial_gripper_depth;
+  int denoiser_type;
+  int diffusion_grasps;
+  int obb_grasps;
+} graspgenx_runtime_c_config_v2;
+
 // Every fallible function returns zero on success. On failure, the returned
 // nonzero status can be expanded with graspgenx_runtime_last_error().
 GRASPGENX_C_API const char* graspgenx_runtime_last_error(void);
 GRASPGENX_C_API int graspgenx_runtime_create(
     const graspgenx_runtime_c_config* config,
+    graspgenx_runtime_handle* output);
+GRASPGENX_C_API int graspgenx_runtime_create_v2(
+    const graspgenx_runtime_c_config_v2* config,
     graspgenx_runtime_handle* output);
 GRASPGENX_C_API void graspgenx_runtime_destroy(
     graspgenx_runtime_handle runtime);

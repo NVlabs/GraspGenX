@@ -5,6 +5,7 @@
 
 #include "cuda_kernels.h"
 #include "execution_domain.h"
+#include "grasp_volume.h"
 #include "tensorrt_plan.h"
 
 #include <cublas_v2.h>
@@ -177,6 +178,7 @@ class Runtime::Impl {
     CreateEvent(&generator_ready_);
     CreateEvent(&discriminator_ready_);
     CreateEvent(&obb_ready_);
+    CreateEvent(&inference_done_);
     for (cudaEvent_t& event : topology_stage_ready_) CreateEvent(&event);
     for (cudaEvent_t& event : topology_pool_data_ready_) CreateEvent(&event);
     for (cudaEvent_t& event : topology_order_ready_) CreateEvent(&event);
@@ -188,6 +190,11 @@ class Runtime::Impl {
     LoadPlans();
     BindPlans();
     SetGripperEmbeddings(nullptr, nullptr);
+    CheckCuda(cudaMemset(grasp_volume_, 0, 6 * sizeof(float)),
+              "initialize grasp volume");
+    CheckCuda(cudaMemcpy(minimum_points_in_volume_,
+                         &config_.minimum_points_in_volume, sizeof(int),
+                         cudaMemcpyHostToDevice), "initialize volume threshold");
     WarmAndCapture();
   }
 
@@ -203,6 +210,7 @@ class Runtime::Impl {
     DestroyEvent(generator_ready_);
     DestroyEvent(discriminator_ready_);
     DestroyEvent(obb_ready_);
+    DestroyEvent(inference_done_);
     for (cudaEvent_t event : topology_stage_ready_) DestroyEvent(event);
     for (cudaEvent_t event : topology_pool_data_ready_) DestroyEvent(event);
     for (cudaEvent_t event : topology_order_ready_) DestroyEvent(event);
@@ -261,10 +269,43 @@ class Runtime::Impl {
               "copy device gripper depth");
   }
 
+  void WaitForInference() {
+    domain_.Activate();
+    if (inference_enqueued_)
+      CheckCuda(cudaEventSynchronize(inference_done_), "wait before volume update");
+  }
+
+  void SetGraspVolume(const float* bounds) {
+    if (bounds == nullptr) throw std::invalid_argument("grasp volume bounds are null");
+    for (int axis = 0; axis < 3; ++axis)
+      if (!std::isfinite(bounds[axis]) || !std::isfinite(bounds[axis + 3]) ||
+          bounds[axis] >= bounds[axis + 3])
+        throw std::invalid_argument("grasp volume requires finite minimum < maximum");
+    WaitForInference();
+    CheckCuda(cudaMemcpy(grasp_volume_, bounds, 6 * sizeof(float),
+                         cudaMemcpyHostToDevice), "copy grasp volume");
+    grasp_volume_configured_ = true;
+  }
+
+  void SetMinimumPointsInVolume(int minimum) {
+    if (minimum < 0 || minimum > kPointCount)
+      throw std::invalid_argument("minimum_points_in_volume must be in [0, 3500]");
+    WaitForInference();
+    CheckCuda(cudaMemcpy(minimum_points_in_volume_, &minimum, sizeof(int),
+                         cudaMemcpyHostToDevice), "copy volume threshold");
+    config_.minimum_points_in_volume = minimum;
+  }
+
+  void RequireGraspVolume() const {
+    if (config_.minimum_points_in_volume > 0 && !grasp_volume_configured_)
+      throw std::logic_error("SetGraspVolume is required when volume filtering is enabled");
+  }
+
   void InferAsync(std::int64_t point_count, std::uint64_t seed,
                   std::uint64_t sequence_offset, cudaStream_t stream) {
     domain_.ValidateStream(stream);
     ValidatePointCount(point_count);
+    RequireGraspVolume();
     if (point_count > kPointCount) {
       throw std::invalid_argument(
           "The zero-copy input buffer holds at most 3500 points; use "
@@ -287,6 +328,8 @@ class Runtime::Impl {
                               stream),
               "copy sequence offset");
     CheckCuda(cudaGraphLaunch(graph_exec_, stream), "cudaGraphLaunch inference");
+    CheckCuda(cudaEventRecord(inference_done_, stream), "record inference completion");
+    inference_enqueued_ = true;
   }
 
   void InferDeviceAsync(const float* points, std::int64_t point_count,
@@ -294,6 +337,7 @@ class Runtime::Impl {
                         cudaStream_t stream) {
     domain_.ValidateStream(stream);
     ValidatePointCount(point_count);
+    RequireGraspVolume();
     if (points == nullptr) {
       throw std::invalid_argument("Device point cloud pointer is null");
     }
@@ -318,6 +362,7 @@ class Runtime::Impl {
                       cudaStream_t stream) {
     domain_.ValidateStream(stream);
     ValidatePointCount(point_count);
+    RequireGraspVolume();
     if (points == nullptr) {
       throw std::invalid_argument("Host point cloud pointer is null");
     }
@@ -345,7 +390,8 @@ class Runtime::Impl {
     return DeviceOutputs{sorted_grasps_, sorted_confidence_, source_indices_,
                          center_, obb_bounds_, topology_valid_counts_,
                          topology_overflow_,
-                         config_.diffusion_grasps + config_.obb_grasps};
+                         config_.diffusion_grasps + config_.obb_grasps,
+                         sorted_valid_};
   }
 
   RuntimeMemory memory() const noexcept {
@@ -356,6 +402,7 @@ class Runtime::Impl {
 
   RuntimeProfile Profile(int warmup_iterations, int measured_iterations) {
     domain_.Activate();
+    RequireGraspVolume();
     if (warmup_iterations < 1 || measured_iterations < 1) {
       throw std::invalid_argument("Profile iteration counts must be positive");
     }
@@ -403,11 +450,7 @@ class Runtime::Impl {
                     config_.obb_grasps, stream),
                 "profile prepare scorer");
       scorer_->Enqueue(stream);
-      CheckCuda(LaunchRankAndTranslate(
-                    diffusion_grasps_, obb_grasps_, scorer_confidence_, center_,
-                    sorted_grasps_, sorted_confidence_, source_indices_,
-                    config_.diffusion_grasps, config_.obb_grasps, stream),
-                "profile rank grasps");
+      RankGrasps(stream);
     });
     RuntimeProfile result;
     result.preprocessing_topology_obb_ms = MeasureGraph(
@@ -487,16 +530,21 @@ class Runtime::Impl {
     return elapsed / measured_iterations;
   }
 
+  int denoising_steps() const noexcept {
+    return DenoisingStepCount(config_.denoiser);
+  }
+
   void ValidateConfig() {
+    if (config_.minimum_points_in_volume < 0 || config_.minimum_points_in_volume > kPointCount)
+      throw std::invalid_argument("minimum_points_in_volume must be in [0, 3500]");
     if (config_.artifact_directory.empty()) {
       throw std::invalid_argument("artifact_directory is required");
     }
     if (!std::isfinite(config_.gripper_depth) || config_.gripper_depth <= 0.0F) {
       throw std::invalid_argument("gripper_depth must be positive and finite");
     }
-    if (config_.diffusion_steps != 5 && config_.diffusion_steps != 10 &&
-        config_.diffusion_steps != 20) {
-      throw std::invalid_argument("diffusion_steps must be one of 5, 10, or 20");
+    if (denoising_steps() == 0) {
+      throw std::invalid_argument("unknown denoiser type");
     }
     if (config_.diffusion_grasps < 1) {
       throw std::invalid_argument("diffusion_grasps must be positive");
@@ -584,8 +632,8 @@ class Runtime::Impl {
     sample_embedding_ = Allocate<__half>(diffusion_grasps * 512);
     prediction_hidden_ = Allocate<__half>(diffusion_grasps * 512);
     initial_sample_ = Allocate<__half>(diffusion_grasps * 6);
-    variance_noise_ = Allocate<__half>(
-        config_.diffusion_steps * diffusion_grasps * 6);
+    variance_noise_ =
+        Allocate<__half>(denoising_steps() * diffusion_grasps * 6);
     state_[0] = Allocate<__half>(diffusion_grasps * 6);
     state_[1] = Allocate<__half>(diffusion_grasps * 6);
     diffusion_grasps_ = Allocate<float>(diffusion_grasps * 16);
@@ -603,18 +651,19 @@ class Runtime::Impl {
     sorted_grasps_ = Allocate<float>(candidates * 16);
     sorted_confidence_ = Allocate<float>(candidates);
     source_indices_ = Allocate<std::int32_t>(candidates);
+    sorted_valid_ = Allocate<std::uint8_t>(candidates);
+    grasp_volume_ = Allocate<float>(6);
+    minimum_points_in_volume_ = Allocate<int>(1);
     seed_ = Allocate<std::uint64_t>(1);
     sequence_offset_ = Allocate<std::uint64_t>(1);
 
     observation_weight_ = Allocate<__half>(2048 * 1024);
-    timestep_conditioning_ =
-        Allocate<__half>(config_.diffusion_steps * 2048);
+    timestep_conditioning_ = Allocate<__half>(denoising_steps() * 2048);
     sample_encoder_weight_ = Allocate<__half>(512 * 6);
     sample_encoder_bias_ = Allocate<__half>(512);
     prediction_weight_ = Allocate<__half>(6 * 512);
     prediction_bias_ = Allocate<__half>(6);
-    ddpm_coefficients_ =
-        Allocate<__half>(config_.diffusion_steps * 5 * 6);
+    denoising_coefficients_ = Allocate<__half>(denoising_steps() * 5 * 6);
   }
 
   void AllocateBranch(EncoderBranch* branch) {
@@ -653,17 +702,13 @@ class Runtime::Impl {
                          sizeof(initial_valid_count), cudaMemcpyHostToDevice),
               "copy initial valid count");
     const auto weights = config_.artifact_directory / "weights";
-    auto schedule_weights =
-        weights / "schedules" / std::to_string(config_.diffusion_steps);
-    if (config_.diffusion_steps == 10 &&
-        !std::filesystem::is_directory(schedule_weights)) {
-      schedule_weights = weights;
-    }
+    const auto schedule_weights =
+        weights / "schedules" / std::to_string(denoising_steps());
     UploadTensor(weights / "observation_weight.bin", observation_weight_,
                  2048 * 1024 * sizeof(__half));
     UploadTensor(schedule_weights / "timestep_conditioning.bin",
                  timestep_conditioning_,
-                 config_.diffusion_steps * 2048 * sizeof(__half));
+                 denoising_steps() * 2048 * sizeof(__half));
     UploadTensor(weights / "sample_encoder_weight.bin", sample_encoder_weight_,
                  512 * 6 * sizeof(__half));
     UploadTensor(weights / "sample_encoder_bias.bin", sample_encoder_bias_,
@@ -672,8 +717,9 @@ class Runtime::Impl {
                  6 * 512 * sizeof(__half));
     UploadTensor(weights / "prediction_bias.bin", prediction_bias_,
                  6 * sizeof(__half));
-    UploadTensor(schedule_weights / "ddpm_coefficients.bin", ddpm_coefficients_,
-                 config_.diffusion_steps * 5 * 6 * sizeof(__half));
+    UploadTensor(schedule_weights / "denoising_coefficients.bin",
+                 denoising_coefficients_,
+                 denoising_steps() * 5 * 6 * sizeof(__half));
     UploadTensor(
         weights / ("sobol_initial_sample_d" +
                    std::to_string(config_.diffusion_grasps) + ".bin"),
@@ -767,7 +813,7 @@ class Runtime::Impl {
               "OBB proposals");
     CheckCuda(LaunchNormalNoiseFp16(
                   seed_, sequence_offset_, variance_noise_,
-                  config_.diffusion_steps * config_.diffusion_grasps * 6,
+                  denoising_steps() * config_.diffusion_grasps * 6,
                   stream),
               "asynchronous diffusion variance noise");
   }
@@ -893,7 +939,7 @@ class Runtime::Impl {
     if (!externally_generated_noise) {
       CheckCuda(LaunchNormalNoiseFp16(
                     seed_, sequence_offset_, variance_noise_,
-                    config_.diffusion_steps * config_.diffusion_grasps * 6,
+                    denoising_steps() * config_.diffusion_grasps * 6,
                     stream),
                 "diffusion variance noise");
     }
@@ -903,39 +949,42 @@ class Runtime::Impl {
                   timestep_conditioning_, sample_embedding_,
                   conditioning_buffer_, config_.diffusion_grasps, 1, stream),
               "initial diffusion sample encode");
-    for (int step = 0; step < config_.diffusion_steps; ++step) {
+    // The released DDPM20 transition table drives this loop.
+    // It runs only during CUDA Graph capture, so steady-state replay has no
+    // per-step host dispatch and reuses one TensorRT denoiser plan.
+    for (int step = 0; step < denoising_steps(); ++step) {
       const void* sample = step == 0 ? static_cast<void*>(initial_sample_)
                                      : static_cast<void*>(state_[(step - 1) & 1]);
       void* output = state_[step & 1];
       denoiser_->Enqueue(stream);
       if (step == 0 && externally_generated_noise) {
         CheckCuda(cudaStreamWaitEvent(stream, obb_ready_),
-                  "DDPM update waits variance noise");
+                  "denoising update waits variance noise");
       }
-      if (step + 1 < config_.diffusion_steps) {
+      if (step + 1 < denoising_steps()) {
         CheckCuda(LaunchDenoiseStepAndSampleEncodeFp16(
                       prediction_hidden_, sample,
                       variance_noise_ + step * config_.diffusion_grasps * 6,
                       prediction_weight_, prediction_bias_,
-                      ddpm_coefficients_ + step * 5 * 6, output,
+                      denoising_coefficients_ + step * 5 * 6, output,
                       sample_encoder_weight_, sample_encoder_bias_,
                       observation_projection_,
                       timestep_conditioning_ + (step + 1) * 2048,
                       sample_embedding_, conditioning_buffer_,
                       config_.diffusion_grasps, 1, stream),
-                  "fused DDPM update and next sample encode");
+                  "fused denoising update and next sample encode");
       } else {
         CheckCuda(LaunchDenoiseStepFp16(
                       prediction_hidden_, sample,
                       variance_noise_ + step * config_.diffusion_grasps * 6,
                       prediction_weight_, prediction_bias_,
-                      ddpm_coefficients_ + step * 5 * 6, output,
+                      denoising_coefficients_ + step * 5 * 6, output,
                       config_.diffusion_grasps, stream),
-                  "final DDPM update");
+                  "final denoising update");
       }
     }
     CheckCuda(LaunchFinalizeSo3Fp16(
-                  state_[(config_.diffusion_steps - 1) & 1], diffusion_grasps_,
+                  state_[(denoising_steps() - 1) & 1], diffusion_grasps_,
                   diffusion_canonical_, config_.diffusion_grasps, kKappa,
                   stream),
               "SO3 finalization");
@@ -967,11 +1016,23 @@ class Runtime::Impl {
                   config_.diffusion_grasps, config_.obb_grasps, root),
               "prepare scorer inputs");
     scorer_->Enqueue(root);
+    RankGrasps(root);
+  }
+
+  void RankGrasps(cudaStream_t stream) {
+    CheckCuda(LaunchFilterGraspVolume(
+                  diffusion_grasps_, obb_grasps_, center_, input_points_,
+                  input_point_count_, grasp_volume_, minimum_points_in_volume_,
+                  scorer_confidence_, config_.diffusion_grasps, config_.obb_grasps, stream),
+              "filter grasp capture volume");
     CheckCuda(LaunchRankAndTranslate(
                   diffusion_grasps_, obb_grasps_, scorer_confidence_, center_,
                   sorted_grasps_, sorted_confidence_, source_indices_,
-                  config_.diffusion_grasps, config_.obb_grasps, root),
+                  config_.diffusion_grasps, config_.obb_grasps, stream),
               "rank and translate grasps");
+    CheckCuda(LaunchGraspValidity(sorted_confidence_, sorted_valid_,
+                                config_.diffusion_grasps + config_.obb_grasps, stream),
+              "expose grasp validity");
   }
 
   void WarmAndCapture() {
@@ -1023,6 +1084,9 @@ class Runtime::Impl {
   cudaEvent_t generator_ready_{};
   cudaEvent_t discriminator_ready_{};
   cudaEvent_t obb_ready_{};
+  cudaEvent_t inference_done_{};
+  bool inference_enqueued_ = false;
+  bool grasp_volume_configured_ = false;
   std::array<cudaEvent_t, kStageCount> topology_stage_ready_{};
   std::array<cudaEvent_t, kStageCount - 1> topology_pool_data_ready_{};
   std::array<cudaEvent_t, kStageCount> topology_order_ready_{};
@@ -1073,6 +1137,9 @@ class Runtime::Impl {
   float* sorted_grasps_{};
   float* sorted_confidence_{};
   std::int32_t* source_indices_{};
+  std::uint8_t* sorted_valid_{};
+  float* grasp_volume_{};
+  int* minimum_points_in_volume_{};
   std::uint64_t* seed_{};
   std::uint64_t* sequence_offset_{};
   std::array<float, kPointCount * 3> host_resampled_points_{};
@@ -1082,7 +1149,7 @@ class Runtime::Impl {
   __half* sample_encoder_bias_{};
   __half* prediction_weight_{};
   __half* prediction_bias_{};
-  __half* ddpm_coefficients_{};
+  __half* denoising_coefficients_{};
 
   std::unique_ptr<detail::TensorRtPlan> denoiser_;
   std::unique_ptr<detail::TensorRtPlan> scorer_;
@@ -1111,6 +1178,14 @@ void Runtime::SetGripperDeviceAsync(
 }
 
 float* Runtime::device_input_points() noexcept { return impl_->input_points(); }
+
+void Runtime::SetGraspVolume(const float* bounds_6) {
+  impl_->SetGraspVolume(bounds_6);
+}
+
+void Runtime::SetMinimumPointsInVolume(int minimum_points) {
+  impl_->SetMinimumPointsInVolume(minimum_points);
+}
 
 void Runtime::InferAsync(std::int64_t point_count, std::uint64_t seed,
                          std::uint64_t sequence_offset, cudaStream_t stream) {

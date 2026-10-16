@@ -33,6 +33,8 @@ export GRASPGENX_CPP_RUNTIME_LIBRARY=/path/to/libgraspgenx_runtime.so
 export GRASPGENX_CPP_RUNTIME_ARTIFACTS=/path/to/artifacts
 ```
 
+The runtime uses the released DDPM20 model.
+
 - `runtime.py` installs and shares the C++ runtime on a model.
 - `cpp_runtime.py` is the small ctypes/device-pointer boundary.
 - `../../cpp_runtime/tools/` contains the offline PyTorch export helpers and

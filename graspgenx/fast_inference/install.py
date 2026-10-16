@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 
 from graspgenx._setup_dependencies import get_checkpoints_version_dir
-from graspgenx.fast_inference._constants import DEFAULT_DDPM_INFERENCE_STEPS
+from graspgenx.fast_inference._constants import artifact_subdirectory
 from graspgenx.fast_inference.cpp_runtime import required_runtime_artifacts
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -65,9 +65,7 @@ def _default_nvcc() -> Path | None:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-root", type=Path, default=_default_release_root())
-    parser.add_argument(
-        "--artifact-directory", type=Path, default=_CPP_RUNTIME / "artifacts"
-    )
+    parser.add_argument("--artifact-directory", type=Path)
     parser.add_argument(
         "--build-directory", type=Path, default=_CPP_RUNTIME / "build-native"
     )
@@ -81,10 +79,10 @@ def parse_args(argv=None):
     parser.add_argument("--cuda-root", type=Path)
     parser.add_argument("--tensorrt-root", type=Path)
     parser.add_argument(
-        "--diffusion-steps",
-        type=int,
-        choices=(5, 10, 20),
-        default=DEFAULT_DDPM_INFERENCE_STEPS,
+        "--denoiser",
+        choices=("ddpm",),
+        default="ddpm",
+        help="sampling schedule to install (DDPM20)",
     )
     parser.add_argument("--diffusion-grasps", type=int, default=100)
     parser.add_argument("--obb-grasps", type=int, default=50)
@@ -131,6 +129,10 @@ def parse_args(argv=None):
         parser.error("jobs must be positive")
     if args.force_artifacts and args.skip_artifacts:
         parser.error("--force-artifacts and --skip-artifacts are mutually exclusive")
+    if args.artifact_directory is None:
+        args.artifact_directory = (
+            _CPP_RUNTIME / "artifacts" / artifact_subdirectory(args.denoiser)
+        )
     return args
 
 
@@ -197,6 +199,8 @@ def _artifact_commands(args) -> list[list[str]]:
             str(artifacts / "weights"),
             "--diffusion-grasps",
             str(args.diffusion_grasps),
+            "--denoiser",
+            args.denoiser,
         ],
         [
             python,
@@ -276,9 +280,9 @@ def _import_build_dependencies():
 def _missing_artifacts(args) -> list[Path]:
     required = required_runtime_artifacts(
         args.artifact_directory.resolve(),
-        diffusion_steps=args.diffusion_steps,
         diffusion_grasps=args.diffusion_grasps,
         obb_grasps=args.obb_grasps,
+        denoiser=args.denoiser,
     )
     return [path for path in required if not path.is_file()]
 
@@ -294,9 +298,9 @@ def _verify(args, library: Path):
     runtime = NativeCppRuntime(
         artifact_directory=args.artifact_directory,
         library_path=library,
-        diffusion_steps=args.diffusion_steps,
         diffusion_grasps=args.diffusion_grasps,
         obb_grasps=args.obb_grasps,
+        denoiser=args.denoiser,
         seed=0,
     )
     try:

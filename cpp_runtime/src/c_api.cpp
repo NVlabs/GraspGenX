@@ -66,6 +66,33 @@ void CopyOptional(T* destination, const T* source, std::size_t count,
             operation);
 }
 
+graspgenx::RuntimeConfig MakeRuntimeConfig(
+    const char* artifact_directory, float initial_gripper_depth,
+    int denoiser_type, int diffusion_grasps, int obb_grasps) {
+  if (artifact_directory == nullptr || artifact_directory[0] == '\0') {
+    throw std::invalid_argument("artifact_directory is required");
+  }
+  graspgenx::RuntimeConfig native;
+  native.artifact_directory = std::filesystem::path(artifact_directory);
+  native.gripper_depth = initial_gripper_depth;
+  if (denoiser_type == GRASPGENX_DENOISER_DDPM) {
+    native.denoiser = graspgenx::DenoiserType::kDdpm;
+
+  } else {
+    throw std::invalid_argument("unknown denoiser_type");
+  }
+  native.diffusion_grasps = diffusion_grasps;
+  native.obb_grasps = obb_grasps;
+  return native;
+}
+
+void CreateRuntime(graspgenx::RuntimeConfig native,
+                   graspgenx_runtime_handle* output) {
+  if (output == nullptr) throw std::invalid_argument("output handle is null");
+  auto runtime = std::make_unique<RuntimeHandle>(std::move(native));
+  *output = runtime.release();
+}
+
 }  // namespace
 
 extern "C" {
@@ -76,20 +103,32 @@ int graspgenx_runtime_create(const graspgenx_runtime_c_config* config,
                             graspgenx_runtime_handle* output) {
   return Guard([&] {
     if (config == nullptr) throw std::invalid_argument("config is null");
-    if (output == nullptr) throw std::invalid_argument("output handle is null");
-    if (config->artifact_directory == nullptr ||
-        config->artifact_directory[0] == '\0') {
-      throw std::invalid_argument("artifact_directory is required");
+    if (config->diffusion_steps != 20) {
+      throw std::invalid_argument(
+          "legacy DDPM config requires exactly 20 diffusion steps");
     }
-    graspgenx::RuntimeConfig native;
-    native.artifact_directory =
-        std::filesystem::path(config->artifact_directory);
-    native.gripper_depth = config->initial_gripper_depth;
-    native.diffusion_steps = config->diffusion_steps;
-    native.diffusion_grasps = config->diffusion_grasps;
-    native.obb_grasps = config->obb_grasps;
-    auto runtime = std::make_unique<RuntimeHandle>(std::move(native));
-    *output = runtime.release();
+    CreateRuntime(
+        MakeRuntimeConfig(config->artifact_directory,
+                          config->initial_gripper_depth,
+                          GRASPGENX_DENOISER_DDPM,
+                          config->diffusion_grasps, config->obb_grasps),
+        output);
+  });
+}
+
+int graspgenx_runtime_create_v2(const graspgenx_runtime_c_config_v2* config,
+                               graspgenx_runtime_handle* output) {
+  return Guard([&] {
+    if (config == nullptr) throw std::invalid_argument("config is null");
+    if (config->struct_size < sizeof(graspgenx_runtime_c_config_v2)) {
+      throw std::invalid_argument("v2 config struct_size is too small");
+    }
+    CreateRuntime(
+        MakeRuntimeConfig(
+            config->artifact_directory, config->initial_gripper_depth,
+            config->denoiser_type, config->diffusion_grasps,
+            config->obb_grasps),
+        output);
   });
 }
 

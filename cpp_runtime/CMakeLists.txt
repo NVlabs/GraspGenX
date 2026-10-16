@@ -34,6 +34,7 @@ get_filename_component(
 add_library(
   graspgenx_runtime SHARED
   src/ptv3_cuda_kernel.cu
+  src/grasp_volume.cu
   src/c_api.cpp
   src/runtime.cpp
   src/tensorrt_plan.cpp)
@@ -69,3 +70,15 @@ install(
 install(
   FILES include/graspgenx/c_api.h include/graspgenx/runtime.h
   DESTINATION include/graspgenx)
+
+option(GRASPGENX_BUILD_TESTS "Build native GPU grasp-volume tests" OFF)
+if(GRASPGENX_BUILD_TESTS)
+  enable_testing()
+  add_executable(graspgenx_grasp_volume_test tests/grasp_volume_test.cpp)
+  target_include_directories(graspgenx_grasp_volume_test PRIVATE src)
+  target_link_libraries(graspgenx_grasp_volume_test PRIVATE graspgenx_runtime CUDA::cudart)
+  add_test(NAME graspgenx_grasp_volume COMMAND graspgenx_grasp_volume_test)
+  set_tests_properties(graspgenx_grasp_volume PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(graspgenx_volume_runtime_test tests/volume_runtime_test.cpp)
+  target_link_libraries(graspgenx_volume_runtime_test PRIVATE graspgenx_runtime CUDA::cudart)
+endif()

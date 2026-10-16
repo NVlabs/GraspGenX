@@ -57,12 +57,12 @@ def test_visualization_keeps_usd_in_a_separate_extra():
     assert extras["usd"] == ["scene-synthesizer", "usd-core"]
 
 
-def _touch_artifacts(directory: Path, steps=20, diffusion=100, obb=50):
+def _touch_artifacts(directory: Path, diffusion=100, obb=50, denoiser="ddpm"):
     paths = required_runtime_artifacts(
         directory,
-        diffusion_steps=steps,
         diffusion_grasps=diffusion,
         obb_grasps=obb,
+        denoiser=denoiser,
     )
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,14 +73,13 @@ def _touch_artifacts(directory: Path, steps=20, diffusion=100, obb=50):
 def test_required_runtime_artifacts_cover_full_native_contract(tmp_path):
     paths = required_runtime_artifacts(
         tmp_path,
-        diffusion_steps=5,
         diffusion_grasps=17,
         obb_grasps=7,
     )
     assert len(paths) == 20
     assert tmp_path / "engines/denoiser_core_d17_fp16.plan" in paths
     assert tmp_path / "engines/scorer_core_c24_fp32.plan" in paths
-    assert tmp_path / "weights/schedules/5/ddpm_coefficients.bin" in paths
+    assert tmp_path / "weights/schedules/20/denoising_coefficients.bin" in paths
     assert sum("ptv3_" in path.name for path in paths) == 10
 
 
@@ -108,6 +107,12 @@ def test_installer_routes_every_generated_file_to_selected_artifact_root(tmp_pat
 
     optimized = parse_args(["--tensorrt-optimization-level", "5"])
     assert _artifact_commands(optimized)[-1][-2:] == ["--optimization-level", "5"]
+
+
+def test_installer_only_supports_ddpm20():
+    assert parse_args([]).artifact_directory.name == "ddpm20"
+    with pytest.raises(SystemExit):
+        parse_args(["--denoiser", "ddim"])
 
 
 def test_cmake_build_places_library_in_python_discovery_directory(tmp_path):

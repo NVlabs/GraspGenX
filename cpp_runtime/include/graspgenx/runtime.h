@@ -11,14 +11,30 @@
 
 namespace graspgenx {
 
+enum class DenoiserType : int {
+  kDdpm = 0,
+};
+
+constexpr int DenoisingStepCount(DenoiserType denoiser) noexcept {
+  switch (denoiser) {
+    case DenoiserType::kDdpm:
+      return 20;
+  }
+  return 0;
+}
+
 struct RuntimeConfig {
   std::filesystem::path artifact_directory;
   float gripper_depth = 0.1034F;
-  int diffusion_steps = 20;
+  DenoiserType denoiser = DenoiserType::kDdpm;
   // These select count-specific dense plans and become immutable when the
   // Runtime captures its graph. They do not require recompiling the library.
   int diffusion_grasps = 100;
   int obb_grasps = 50;
+  // Zero preserves unfiltered inference. Positive values require SetGraspVolume
+  // before inference and count supplied input points (at most 3500), before
+  // the encoder's filter/resample step. Range: [0, kEnginePointCount].
+  int minimum_points_in_volume = 0;
 };
 
 struct DeviceOutputs {
@@ -30,6 +46,9 @@ struct DeviceOutputs {
   const std::int64_t* ptv3_stage_counts = nullptr;  // [5]
   const bool* ptv3_topology_overflow = nullptr;     // [4], invalid if any true
   int grasp_count = 0;
+  // [grasp_count], 0/1. Valid candidates form a score-sorted prefix. Rejected
+  // candidates follow with confidence zero; source_indices remain aligned.
+  const std::uint8_t* valid = nullptr;
 };
 
 struct RuntimeMemory {
@@ -65,6 +84,13 @@ class Runtime {
   // encoders outside the plans lets the same plans serve different grippers.
   void SetGripperEmbeddings(const float* generator_embedding_512,
                             const float* discriminator_embedding_512);
+
+  // Host FP32 [xmin,ymin,zmin,xmax,ymax,zmax] in the gripper pose frame,
+  // including the gripper's configured standoff. Bounds must be finite and
+  // strictly increasing. These control updates wait for this runtime's last
+  // inference; they do not recapture the graph. Host calls must be serialized.
+  void SetGraspVolume(const float* bounds_6);
+  void SetMinimumPointsInVolume(int minimum_points);
 
   // Steady-state Python/interop path. Inputs are device-resident generator
   // FP16 [512] and discriminator FP32 [512] embeddings. The copies and depth

@@ -12,10 +12,27 @@ import json
 from pathlib import Path
 
 import numpy as np
-import torch
 
-from graspgenx.models.grasp_gen import GraspGen
-from graspgenx.utils.checkpoint_io import load_model_cfg
+
+def validate_grasp_volume(bounds):
+    bounds = np.asarray(bounds, dtype=np.float32).reshape(2, 3)
+    if not np.isfinite(bounds).all() or not (bounds[0] < bounds[1]).all():
+        raise ValueError("grasp volume requires finite minimum < maximum")
+    return bounds
+
+
+def grasp_volume_from_config(config):
+    """Match x_grippers.load_gripper's capture bounds, including standoff."""
+    sweep = config["sweep_volume"]
+    extents = np.asarray(sweep["extents"], dtype=np.float64).reshape(3)
+    offset = np.asarray(sweep["offset"], dtype=np.float64).reshape(3)
+    standoff = np.asarray(config["standoff"], dtype=np.float64).reshape(2)
+    if not np.isfinite(extents).all() or not (extents > 0).all():
+        raise ValueError("sweep volume extents must be positive and finite")
+    return validate_grasp_volume([
+        offset - extents / 2 + [0, 0, standoff[0]],
+        offset + extents / 2 + [0, 0, standoff[1]],
+    ])
 
 
 def parse_args():
@@ -46,17 +63,25 @@ def parse_args():
         help="Fingertip depth in meters; inferred for --gripper-name",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--grasp-volume", nargs=6, type=float, metavar="B",
+        help="Explicit xmin ymin zmin xmax ymax zmax for raw descriptors; named grippers use config.json standoff",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     gripper_depth = args.gripper_depth
+    grasp_volume = None
     if args.gripper_name is not None:
+        if args.grasp_volume is not None:
+            raise ValueError("named grippers use the grasp volume from config.json")
         config_path = args.assets_dir / args.gripper_name / "config.json"
         with config_path.open() as stream:
             config = json.load(stream)
         sweep = config["sweep_volume"]
+        grasp_volume = grasp_volume_from_config(config)
         descriptor = np.concatenate(
             (
                 sweep["extents"],
@@ -71,11 +96,17 @@ def main():
         descriptor = np.load(args.input_npy)
     else:
         descriptor = np.asarray(args.values, dtype=np.float32)
+    if args.grasp_volume is not None:
+        grasp_volume = validate_grasp_volume(args.grasp_volume)
     descriptor = np.asarray(descriptor, dtype=np.float32).reshape(1, 12)
     if gripper_depth is not None and (
         not np.isfinite(gripper_depth) or gripper_depth <= 0.0
     ):
         raise ValueError("gripper depth must be a positive finite value")
+    import torch
+    from graspgenx.models.grasp_gen import GraspGen
+    from graspgenx.utils.checkpoint_io import load_model_cfg
+
     cfg = load_model_cfg(args.release_root / "gen", args.release_root / "dis")
     model = GraspGen.from_config(cfg.diffusion, cfg.discriminator)
     model.load_state_dict(cfg.eval.gen_checkpoint, cfg.eval.dis_checkpoint)
@@ -85,21 +116,24 @@ def main():
         generator = model.grasp_generator.gripper_encoder(value).float().numpy()
         discriminator = model.grasp_discriminator.gripper_encoder(value).float().numpy()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        args.output,
-        descriptor=descriptor,
-        generator_embedding=generator,
-        discriminator_embedding=discriminator,
-        gripper_depth=np.asarray(
+    values = dict(
+        descriptor=descriptor, generator_embedding=generator,
+        discriminator_embedding=discriminator, gripper_depth=np.asarray(
             np.nan if gripper_depth is None else gripper_depth, dtype=np.float32
         ),
     )
+    if grasp_volume is not None:
+        values["grasp_volume"] = grasp_volume
+    np.savez(args.output, **values)
     raw_files = {}
-    for name, array in (
+    raw_arrays = [
         ("descriptor", descriptor),
         ("generator_embedding", generator),
         ("discriminator_embedding", discriminator),
-    ):
+    ]
+    if grasp_volume is not None:
+        raw_arrays.append(("grasp_volume", grasp_volume))
+    for name, array in raw_arrays:
         path = args.output.with_suffix(f".{name}.fp32.bin")
         contiguous = np.ascontiguousarray(array, dtype="<f4")
         contiguous.tofile(path)
@@ -113,6 +147,7 @@ def main():
         "format": "little-endian contiguous FP32",
         "gripper_name": args.gripper_name,
         "gripper_depth": gripper_depth,
+        "grasp_volume": None if grasp_volume is None else grasp_volume.tolist(),
         "npz": args.output.name,
         "raw_files": raw_files,
     }

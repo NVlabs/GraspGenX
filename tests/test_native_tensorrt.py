@@ -19,6 +19,7 @@ from cpp_runtime.tools.artifact_tools import (
 )
 from graspgenx._constants import MIN_OBJECT_POINT_COUNT
 from graspgenx.fast_inference import DEFAULT_DDPM_INFERENCE_STEPS
+from graspgenx.fast_inference._constants import denoising_steps
 from graspgenx.fast_inference.cpp_runtime import (
     NativeCppRuntime,
     NativeGripperEmbeddings,
@@ -38,24 +39,16 @@ def test_default_inference_uses_released_twenty_step_schedule():
     assert DEFAULT_DDPM_INFERENCE_STEPS == 20
 
 
-def test_respaced_ddpm_presets_remain_offline_artifact_contracts():
+def test_ddpm_only_supports_the_released_twenty_step_schedule():
     generator = SimpleNamespace(num_diffusion_iters=20, num_diffusion_iters_eval=10)
-    assert inference_timesteps(generator).tolist() == [
-        19,
-        17,
-        15,
-        13,
-        11,
-        8,
-        6,
-        4,
-        2,
-        0,
-    ]
-    assert inference_timesteps(generator, 5).tolist() == [19, 8, 5, 3, 0]
-    assert inference_timesteps(generator, 20).tolist() == list(range(19, -1, -1))
-    with pytest.raises(ValueError, match="one of 5, 10, 20"):
-        inference_timesteps(generator, 6)
+    assert inference_timesteps(generator).tolist() == list(range(19, -1, -1))
+    assert denoising_steps("ddpm") == 20
+
+
+def test_native_runtime_rejects_unsupported_denoisers():
+    for denoiser in ("ddim", "unknown"):
+        with pytest.raises(ValueError, match="denoiser must"):
+            NativeCppRuntime(denoiser=denoiser)
 
 
 def test_normal_sobol_artifacts_are_finite_nested_prefixes():
@@ -75,7 +68,6 @@ def test_cpp_artifact_resolver_reports_count_specific_missing_files(tmp_path):
 def test_cpp_artifact_resolver_explains_fixed_domain_mismatch(tmp_path):
     for path in required_runtime_artifacts(
         tmp_path,
-        diffusion_steps=20,
         diffusion_grasps=100,
         obb_grasps=50,
     ):
@@ -86,7 +78,6 @@ def test_cpp_artifact_resolver_explains_fixed_domain_mismatch(tmp_path):
     with pytest.raises(FileNotFoundError) as error:
         resolve_artifact_directory(
             tmp_path,
-            diffusion_steps=20,
             diffusion_grasps=200,
             obb_grasps=50,
         )
@@ -124,7 +115,7 @@ def test_shared_cpp_runtime_rejects_shape_reconfiguration():
 
     model = SimpleNamespace(
         native_cpp_runtime=SimpleNamespace(
-            diffusion_steps=20, diffusion_grasps=100, obb_grasps=50
+            denoiser="ddpm", diffusion_grasps=100, obb_grasps=50
         )
     )
     with pytest.raises(ValueError, match="already has native runtime"):
@@ -181,7 +172,6 @@ def test_python_boundary_replays_cpp_runtime_deterministically():
     runtime = NativeCppRuntime(
         artifact_directory=artifacts,
         library_path=_NATIVE_LIBRARY,
-        diffusion_steps=20,
         diffusion_grasps=100,
         obb_grasps=50,
         seed=7,

@@ -7,8 +7,8 @@ TensorRT; it does not link or import PyTorch, LibTorch, ATen, ONNX Runtime, or
 Python.
 
 PyTorch and ONNX are used only by the offline checkpoint-to-plan tools.
-All deployed custom CUDA kernels live in `src/ptv3_cuda_kernel.cu` and are
-compiled only as part of this runtime.
+All deployed custom CUDA kernels live in this runtime's `src/` directory and
+are compiled only as part of this runtime.
 
 ## Runtime contract
 
@@ -20,7 +20,7 @@ compiled only as part of this runtime.
 - a positive, runtime-construction-time diffusion candidate count (default 100);
 - a non-negative analytic top-down OBB candidate count (default 50);
 - at most 4,096 combined candidates;
-- selectable tuned 5- or 10-step, or default released 20-step DDPM denoising;
+- released 20-step DDPM denoising;
 - FP16 PTV3 and denoiser plans;
 - strict FP32 discriminator/scorer;
 - independent generator and discriminator PTV3 weights with shared topology;
@@ -35,16 +35,54 @@ then set the counts in `RuntimeConfig`. The same library binary supports every
 configuration; this keeps the hot path fixed-shape without making users rebuild
 the runtime.
 
+When updating this C++ header/library pair, rebuild C++ consumers together.
+The existing C-ABI config layouts and inference entry points are unchanged.
+
 The hot path uses persistent buffers and a multi-stream CUDA Graph. OBB runs on
 a side stream while PTV3 topology is completed. The two learned PTV3 branches
 run concurrently after the shared topology is ready. Denoising begins as soon
 as the generator embedding is ready; scoring waits for denoising, OBB, and the
 discriminator embedding.
 
-Between recurrent steps, one CUDA kernel performs the DDPM update and the next
+Between recurrent steps, one CUDA kernel performs the denoising update and next
 6-to-512 sample projection together. The intermediate state is still rounded
 to FP16 exactly as in the unfused path, so this removes launches without
 changing the validated output.
+
+## Grasp-volume admission
+
+Set `RuntimeConfig.minimum_points_in_volume` to a positive value, then call
+`Runtime::SetGraspVolume(bounds)` with host FP32
+`[xmin,ymin,zmin,xmax,ymax,zmax]` in the gripper frame, including standoff.
+Enabled filtering rejects inference until bounds have been supplied. The default
+threshold is zero to preserve existing unfiltered C++ and C-ABI callers.
+`SetMinimumPointsInVolume` accepts 0 through 3500 and updates the captured graph's
+device parameter without recapture; zero disables this optional filter.
+
+The GPU transforms the supplied object points into each candidate's gripper
+frame, counts finite points inside the inclusive bounds, and rejects candidates
+with insufficient occupancy or malformed poses/scores. It counts input points
+after the optional downsample to 3500 and before encoder filtering/repetition,
+so encoder upsampling cannot inflate occupancy. Inputs are sampled points, not
+a guarantee of distinct physical surface samples.
+
+Passing candidates form a descending-score prefix in `DeviceOutputs`.
+`DeviceOutputs.valid` is an aligned CUDA uint8 array of 0/1 values; rejected
+candidates follow with confidence zero. A valid zero-score candidate precedes
+rejected candidates. Poses and source indices retain their correspondence.
+Filtering/ranking stays inside the CUDA graph without point/pose readback.
+The setters wait for the runtime's last inference event before updating bounds
+or threshold. Serialize host calls and order inference requests on their CUDA
+streams; one runtime instance owns one shared set of input/output buffers.
+
+The offline gripper exporter includes exact `grasp_volume` bounds in the NPZ
+and a raw FP32 file for named grippers, using `config.json` sweep volume and
+standoff with the same convention as `x_grippers`. Raw descriptor exports can
+provide all six bounds with `--grasp-volume`.
+
+Configure `-DGRASPGENX_BUILD_TESTS=ON` to build the GPU filter/ranking fixtures
+and `graspgenx_volume_runtime_test`. Run the latter with a DDPM20 artifact
+directory to verify the actual captured inference graph and setters.
 
 ## Source installation
 
@@ -94,7 +132,7 @@ Use `--dry-run` to inspect the underlying commands. `--skip-artifacts` and
 Generated files remain ignored under `cpp_runtime/artifacts/`. Production uses:
 
 ```text
-artifacts/
+artifacts/ddpm20/
   engines/
     denoiser_core_d100_fp16.plan
     scorer_core_c150_fp32.plan
@@ -104,9 +142,9 @@ artifacts/
     sample_encoder_{weight,bias}.bin
     prediction_{weight,bias}.bin
     sobol_initial_sample_d100.bin
-    schedules/{5,10,20}/
+    schedules/20/
       timestep_conditioning.bin
-      ddpm_coefficients.bin
+      denoising_coefficients.bin
 ```
 
 Changing Python-side grippers requires no extra installation: their small
@@ -116,7 +154,7 @@ application can export raw embeddings separately:
 ```bash
 .venv/bin/python cpp_runtime/tools/export_gripper_embeddings.py \
   --gripper-name robotiq_2f_85 \
-  --output cpp_runtime/artifacts/robotiq_2f_85_embeddings.npz
+  --output cpp_runtime/artifacts/ddpm20/robotiq_2f_85_embeddings.npz
 ```
 
 The exporter writes raw little-endian FP32 files and a hash manifest. Changing
@@ -128,9 +166,8 @@ grippers does not rebuild any TensorRT plan.
 #include <graspgenx/runtime.h>
 
 graspgenx::RuntimeConfig config;
-config.artifact_directory = "cpp_runtime/artifacts";
+config.artifact_directory = "cpp_runtime/artifacts/ddpm20";
 config.gripper_depth = 0.136F;
-config.diffusion_steps = 20;  // Select 5, 10, or 20 before graph capture.
 config.diffusion_grasps = 100;
 config.obb_grasps = 50;
 graspgenx::Runtime runtime(config);
@@ -145,6 +182,10 @@ graspgenx::DeviceOutputs output = runtime.outputs();
 // output.ptv3_stage_counts         device int64 [5]
 // output.ptv3_topology_overflow    device bool [4]
 ```
+
+The runtime uses the released DDPM20 model with no separate step-count input.
+All recurrent denoiser executions are captured in the single inference CUDA
+Graph.
 
 `InferDeviceAsync` accepts any cloud with at least 100 points. It downsamples
 clouds above 3,500 directly on CUDA and launches the graph on the caller
@@ -178,53 +219,25 @@ future create-or-borrow `GreenDomain` without virtual dispatch in the pipeline.
 
 ```bash
 cpp_runtime/build-native/graspgenx_benchmark_runtime \
-  cpp_runtime/artifacts \
-  cpp_runtime/artifacts/robotiq_2f_85_embeddings.generator_embedding.fp32.bin \
-  cpp_runtime/artifacts/robotiq_2f_85_embeddings.discriminator_embedding.fp32.bin \
-  0.136 20 100 50
+  cpp_runtime/artifacts/ddpm20 \
+  cpp_runtime/artifacts/ddpm20/robotiq_2f_85_embeddings.generator_embedding.fp32.bin \
+  cpp_runtime/artifacts/ddpm20/robotiq_2f_85_embeddings.discriminator_embedding.fp32.bin \
+  0.136 100 50
 ```
 
 RTX 5090 measurements for the default 100-diffusion + 50-OBB configuration use
 three independent processes, each with 5,000 warmups and 5,000 CUDA-Graph
 replays:
 
-| DDPM preset | Denoising | Point cloud to 150 ranked grasps |
+| DDPM schedule | Denoising | Point cloud to 150 ranked grasps |
 |---:|---:|---:|
-| tuned 5-step `[19,8,5,3,0]` | **0.349 ms** | **1.189 ms** |
-| tuned 10-step | **0.692 ms** | **1.532 ms** |
 | default released 20-step | **1.380 ms** | **2.216 ms** |
-
-The 10-step median component split is:
-
-| Component | Time |
-|---|---:|
-| Filter, center, topology, and parallel OBB/noise | **0.0955 ms** |
-| Filter, center, scale, and grid only | 0.0491 ms |
-| PTV3 topology only | **0.0473 ms** |
-| OBB proposals and diffusion noise only | 0.0348 ms |
-| Concurrent generator + discriminator PTV3 | 0.678 ms |
-| 10 respaced DDPM steps + final pose | **0.692 ms** |
-| FP32 scorer + ranking | 0.031 ms |
-| Full graph | **1.532 ms** |
-| Public call including seed/offset updates | **1.532 ms** |
-
-Additional count-specific measurements use the same C++ binary and two artifact
-sets, with 500 warmups and 500 timed CUDA-Graph replays per set:
-
-| Diffusion + OBB | Denoising | Scorer + rank | Full pipeline |
-|---:|---:|---:|---:|
-| 100 + 50 | 0.684 ms | 0.0307 ms | **1.520 ms** |
-| 200 + 75 | 0.868 ms | 0.0349 ms | **1.704 ms** |
-
-The effectively unchanged default scorer/ranker time versus the earlier fixed
-implementation (0.0307 vs 0.031 ms) is why candidate counts are not C++
-compile-time constants.
 
 Memory in the same pure C++ process:
 
 | Allocation view | Memory |
 |---|---:|
-| Explicit persistent CUDA arena | 14.02 / 14.05 / 14.10 MiB for 5 / 10 / 20 steps |
+| Explicit persistent CUDA arena | 14.10 MiB for 20 steps |
 | Sum of TensorRT context workspace sizes | 63.91 MiB |
 | `cudaMemGetInfo` delta, including context/libraries/weights/graphs | 430 MiB |
 | NVML process-resident GPU memory | **928 MiB** |

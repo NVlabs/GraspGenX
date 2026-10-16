@@ -13,13 +13,13 @@ from pathlib import Path
 
 import torch
 from artifact_tools import (
-    DDPM_TIMESTEP_PRESETS,
     fold_attention,
     normal_sobol_samples,
     scheduler_coefficients,
 )
 from torch.nn import functional
 
+from graspgenx.fast_inference._constants import denoising_steps
 from graspgenx.models.grasp_gen import GraspGen
 from graspgenx.utils.checkpoint_io import load_model_cfg
 
@@ -38,6 +38,7 @@ def parse_args():
         default=root / "cpp_runtime/artifacts/weights",
     )
     parser.add_argument("--diffusion-grasps", type=int, default=100)
+    parser.add_argument("--denoiser", choices=("ddpm",), default="ddpm")
     return parser.parse_args()
 
 
@@ -53,7 +54,7 @@ def main():
     if args.diffusion_grasps < 1:
         raise ValueError("--diffusion-grasps must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    diffusion_steps = tuple(DDPM_TIMESTEP_PRESETS)
+    step_count = denoising_steps(args.denoiser)
     model = load_model(args.release_root)
     generator = model.grasp_generator
     head = generator.diffusion_head
@@ -71,7 +72,8 @@ def main():
         "format": "contiguous little-endian raw tensor files",
         "kappa": float(generator.kappa),
         "grid_size": float(generator.grid_size),
-        "diffusion_presets": list(diffusion_steps),
+        "denoiser": args.denoiser,
+        "denoising_steps": step_count,
         "diffusion_grasps": args.diffusion_grasps,
         "tensors": {},
         "schedules": {},
@@ -99,27 +101,28 @@ def main():
         )
         report["tensors"][name] = write_tensor(output_name, value, args.output_dir)
 
-    for step_count in diffusion_steps:
-        timesteps, coefficients, _ = scheduler_coefficients(generator, step_count)
-        with torch.inference_mode():
-            timestep_embeddings = head.diffusion_step_encoder(timesteps).float()
-            timestep_conditioning = functional.linear(
-                timestep_embeddings, first_weight[:, 512:1024], first_bias
-            ).half()
-        schedule_directory = args.output_dir / "schedules" / str(step_count)
-        report["schedules"][str(step_count)] = {
-            "timesteps": timesteps.tolist(),
-            "tensors": {
-                "timestep_conditioning": write_tensor(
-                    "timestep_conditioning",
-                    timestep_conditioning,
-                    schedule_directory,
-                ),
-                "ddpm_coefficients": write_tensor(
-                    "ddpm_coefficients", coefficients.half(), schedule_directory
-                ),
-            },
-        }
+    timesteps, coefficients, _ = scheduler_coefficients(
+        generator, denoiser=args.denoiser
+    )
+    with torch.inference_mode():
+        timestep_embeddings = head.diffusion_step_encoder(timesteps).float()
+        timestep_conditioning = functional.linear(
+            timestep_embeddings, first_weight[:, 512:1024], first_bias
+        ).half()
+    schedule_directory = args.output_dir / "schedules" / str(step_count)
+    report["schedules"][str(step_count)] = {
+        "timesteps": timesteps.tolist(),
+        "tensors": {
+            "timestep_conditioning": write_tensor(
+                "timestep_conditioning",
+                timestep_conditioning,
+                schedule_directory,
+            ),
+            "denoising_coefficients": write_tensor(
+                "denoising_coefficients", coefficients.half(), schedule_directory
+            ),
+        },
+    }
     manifest = args.output_dir / f"manifest_d{args.diffusion_grasps}.json"
     manifest.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

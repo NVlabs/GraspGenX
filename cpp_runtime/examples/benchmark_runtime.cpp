@@ -71,11 +71,11 @@ std::vector<float> ReadFloatFile(const char* path, std::size_t count) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2 && argc != 3 && argc != 5 && argc != 6 && argc != 8) {
+  if (argc != 2 && argc != 4 && argc != 5 && argc != 7) {
     std::cerr
         << "usage: graspgenx_benchmark_runtime ARTIFACT_DIRECTORY "
            "[GENERATOR_EMBEDDING_BIN DISCRIMINATOR_EMBEDDING_BIN "
-           "GRIPPER_DEPTH] [DDPM_STEPS [DIFFUSION_GRASPS OBB_GRASPS]]\n";
+           "GRIPPER_DEPTH] [DIFFUSION_GRASPS OBB_GRASPS]\n";
     return 2;
   }
   try {
@@ -87,13 +87,14 @@ int main(int argc, char** argv) {
     Check(cudaMemGetInfo(&free_before, &total), "cudaMemGetInfo before");
     graspgenx::RuntimeConfig config;
     config.artifact_directory = argv[1];
-    const bool has_embeddings = argc == 5 || argc == 6 || argc == 8;
+    const bool has_embeddings = argc == 5 || argc == 7;
     if (has_embeddings) config.gripper_depth = std::stof(argv[4]);
-    if (argc == 3) config.diffusion_steps = std::stoi(argv[2]);
-    if (argc == 6 || argc == 8) config.diffusion_steps = std::stoi(argv[5]);
-    if (argc == 8) {
-      config.diffusion_grasps = std::stoi(argv[6]);
-      config.obb_grasps = std::stoi(argv[7]);
+    if (argc == 4) {
+      config.diffusion_grasps = std::stoi(argv[2]);
+      config.obb_grasps = std::stoi(argv[3]);
+    } else if (argc == 7) {
+      config.diffusion_grasps = std::stoi(argv[5]);
+      config.obb_grasps = std::stoi(argv[6]);
     }
     graspgenx::Runtime runtime(config);
     if (has_embeddings) {
@@ -122,7 +123,8 @@ int main(int argc, char** argv) {
     runtime.InferHostAsync(points.data(), kPointCount, 7, 0, stream);
     Check(cudaStreamSynchronize(stream), "initial inference");
     const std::uint64_t random_pairs =
-        static_cast<std::uint64_t>(config.diffusion_steps) *
+        static_cast<std::uint64_t>(
+            graspgenx::DenoisingStepCount(config.denoiser)) *
         static_cast<std::uint64_t>(config.diffusion_grasps) * 3;
     for (int iteration = 0; iteration < benchmark_iterations; ++iteration) {
       runtime.InferAsync(kPointCount, 7,
@@ -179,7 +181,9 @@ int main(int argc, char** argv) {
     const graspgenx::RuntimeMemory memory = runtime.memory();
     const auto process_gpu_mib = QueryProcessGpuMib();
     const float inference_ms = milliseconds / benchmark_iterations;
-    std::cout << "diffusion_steps: " << config.diffusion_steps << '\n'
+    std::cout << "denoiser: ddpm\n"
+              << "denoising_steps: "
+              << graspgenx::DenoisingStepCount(config.denoiser) << '\n'
               << "diffusion_grasps: " << config.diffusion_grasps << '\n'
               << "obb_grasps: " << config.obb_grasps << '\n'
               << "candidate_count: " << runtime.outputs().grasp_count << '\n'
