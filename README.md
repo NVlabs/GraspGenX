@@ -280,10 +280,10 @@ Supported mesh formats: `.obj`, `.stl`, `.ply`, and USD (`.usd`, `.usda`, `.usdc
 Beyond predicting grasps, [`end2end/`](end2end/README.md) wires GraspGenX into
 a full closed-loop pick-and-place pipeline: **GraspGenX** grasps → **cuRobo**
 collision-free motion planning → **Newton/MuJoCo** physics replay (gravity +
-contacts) → **MP4** render + **USD** export for IsaacSim / Omniverse. Three
+contacts) → **MP4** render + **USD** export for IsaacSim / Omniverse. Four
 example demos ship out of the box — a Franka Panda (single object → bin, and a
-3-object clutter scene → bin) and a UR10e with a multi-finger hand
-(arx_x5 pick-and-lift).
+3-object clutter scene → bin) and a UR10e pick-and-lift with an arx_x5 or a
+Robotiq 2F-140.
 
 This pipeline needs an extra dependency stack (cuRobo, Newton, MuJoCo, CoACD,
 USD, fcl):
