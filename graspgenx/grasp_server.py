@@ -16,6 +16,7 @@ from graspgenx.x_grippers import (
     XGripperInfo,
     make_sweep_volume_gripper_info,
     resolve_gripper_info,
+    sample_gripper_pointclouds,
 )
 from graspgenx.utils.logging_config import get_logger
 
@@ -463,25 +464,11 @@ class GraspGenXSampler:
             np.concatenate([sweep_volume_open, sweep_volume_mid], axis=0)
         ).cuda()
 
-        gripper_open_ptc = self.gripper.open_pointcloud.copy()
-        gripper_close_ptc = self.gripper.close_pointcloud.copy()
-
-        mask = np.random.randint(
-            0, gripper_open_ptc.shape[0], (self.cfg.data.num_points,)
+        gripper_open_ptc, gripper_close_ptc = sample_gripper_pointclouds(
+            self.gripper, self.cfg.data.num_points
         )
-        gripper_open_ptc = torch.from_numpy(
-            gripper_close_ptc[mask].astype(np.float32)
-        ).cuda()
-
-        mask = np.random.randint(
-            0, gripper_close_ptc.shape[0], (self.cfg.data.num_points,)
-        )
-        gripper_close_ptc = torch.from_numpy(
-            gripper_close_ptc[mask].astype(np.float32)
-        ).cuda()
-
-        outputs["gripper_open_ptc"] = gripper_open_ptc
-        outputs["gripper_close_ptc"] = gripper_close_ptc
+        outputs["gripper_open_ptc"] = torch.from_numpy(gripper_open_ptc).cuda()
+        outputs["gripper_close_ptc"] = torch.from_numpy(gripper_close_ptc).cuda()
 
         vol_tsdf = np.stack(
             [self.gripper.vol_tsdf[f"open_tsdf"], self.gripper.vol_tsdf[f"close_tsdf"]],

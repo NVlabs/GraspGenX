@@ -65,7 +65,7 @@ from graspgenx.dataset.visualize_utils import (
     visualize_xgripper_generator_dataset,
     visualize_generator_dataset,
 )
-from graspgenx.x_grippers import resolve_gripper_info
+from graspgenx.x_grippers import resolve_gripper_info, sample_gripper_pointclouds
 from graspgenx.utils.logging_config import get_logger
 
 # Configure logging
@@ -1127,17 +1127,11 @@ class XGraspObjectPickDataset(Dataset):
             np.concatenate([sweep_volume_open, sweep_volume_mid], axis=0)
         )
 
-        gripper_open_ptc = self.grippers[gripper_name].open_pointcloud.copy()
-        gripper_close_ptc = self.grippers[gripper_name].close_pointcloud.copy()
-
-        mask = np.random.randint(0, gripper_open_ptc.shape[0], (self.num_points,))
-        gripper_open_ptc = torch.from_numpy(gripper_close_ptc[mask].astype(np.float32))
-
-        mask = np.random.randint(0, gripper_close_ptc.shape[0], (self.num_points,))
-        gripper_close_ptc = torch.from_numpy(gripper_close_ptc[mask].astype(np.float32))
-
-        outputs["gripper_open_ptc"] = gripper_open_ptc
-        outputs["gripper_close_ptc"] = gripper_close_ptc
+        gripper_open_ptc, gripper_close_ptc = sample_gripper_pointclouds(
+            self.grippers[gripper_name], self.num_points
+        )
+        outputs["gripper_open_ptc"] = torch.from_numpy(gripper_open_ptc)
+        outputs["gripper_close_ptc"] = torch.from_numpy(gripper_close_ptc)
 
         vol_tsdf = np.stack(
             [

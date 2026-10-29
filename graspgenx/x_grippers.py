@@ -65,6 +65,20 @@ def load_control_points(w, d):
     return control_points.T
 
 
+def sample_gripper_pointclouds(gripper: XGripperInfo, num_points: int):
+    """Resample the open and closed gripper point clouds to ``num_points`` each.
+
+    Points are drawn with replacement, each from its own state's cloud.
+    Returns ``(open_points, close_points)`` as float32 arrays of shape
+    ``(num_points, 3)``.
+    """
+    sampled = []
+    for points in (gripper.open_pointcloud, gripper.close_pointcloud):
+        mask = np.random.randint(0, points.shape[0], (num_points,))
+        sampled.append(points[mask].astype(np.float32))
+    return sampled[0], sampled[1]
+
+
 def load_control_points_for_visualization(ctrl_pts):
 
     control_points = ctrl_pts.T
