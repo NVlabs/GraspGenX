@@ -18,6 +18,7 @@ import torch
 from artifact_tools import fold_attention
 from torch import nn
 from torch.nn import functional
+from artifact_tools import layer_norm_fp32, gelu_fp32
 
 from graspgenx.models.grasp_gen import GraspGen
 from graspgenx.utils.checkpoint_io import load_model_cfg
@@ -54,7 +55,7 @@ class FoldedDenoiserCore(nn.Module):
                 hidden = hidden + conditioning_projection
             else:
                 hidden = functional.linear(hidden, weight, bias)
-            hidden = functional.layer_norm(
+            hidden = layer_norm_fp32(
                 hidden,
                 (hidden.shape[-1],),
                 attention_norm.weight,
@@ -63,10 +64,10 @@ class FoldedDenoiserCore(nn.Module):
             )
             residual = hidden
             hidden = functional.linear(hidden, ffn.ff[0].weight, ffn.ff[0].bias)
-            hidden = functional.gelu(hidden, approximate="none")
+            hidden = gelu_fp32(hidden, approximate="none")
             hidden = functional.linear(hidden, ffn.ff[2].weight, ffn.ff[2].bias)
             hidden = residual + hidden
-            hidden = functional.layer_norm(
+            hidden = layer_norm_fp32(
                 hidden,
                 (hidden.shape[-1],),
                 ffn.norm.weight,

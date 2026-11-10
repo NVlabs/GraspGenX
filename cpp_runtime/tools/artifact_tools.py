@@ -177,3 +177,17 @@ __all__ = [
     "normal_sobol_samples",
     "scheduler_coefficients",
 ]
+
+
+def layer_norm_fp32(value, shape, weight, bias, eps):
+    """State normalization accumulation precision explicitly for strong typing."""
+    return torch.nn.functional.layer_norm(
+        value.float(), shape, weight.float(), bias.float(), eps
+    ).to(value.dtype)
+
+
+def gelu_fp32(value, approximate="none"):
+    """Match FP32 activation arithmetic followed by an FP16 storage boundary."""
+    return torch.nn.functional.gelu(value.float(), approximate=approximate).to(
+        value.dtype
+    )

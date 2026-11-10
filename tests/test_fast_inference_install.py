@@ -4,12 +4,20 @@
 import importlib.util
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # Python 3.10, supplied by pytest.
 
 import pytest
 
 from graspgenx.fast_inference.cpp_runtime import required_runtime_artifacts
+from graspgenx.fast_inference._profiles import (
+    DEFAULT_STAGE_CAPACITIES,
+    write_stage_capacities,
+)
 from graspgenx.fast_inference.install import (
     _artifact_commands,
     _cmake_commands,
@@ -67,6 +75,7 @@ def _touch_artifacts(directory: Path, diffusion=100, obb=50, denoiser="ddpm"):
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
+    write_stage_capacities(directory / "engines", DEFAULT_STAGE_CAPACITIES)
     return paths
 
 
@@ -76,11 +85,11 @@ def test_required_runtime_artifacts_cover_full_native_contract(tmp_path):
         diffusion_grasps=17,
         obb_grasps=7,
     )
-    assert len(paths) == 20
+    assert len(paths) == 12
     assert tmp_path / "engines/denoiser_core_d17_fp16.plan" in paths
     assert tmp_path / "engines/scorer_core_c24_fp32.plan" in paths
     assert tmp_path / "weights/schedules/20/denoising_coefficients.bin" in paths
-    assert sum("ptv3_" in path.name for path in paths) == 10
+    assert sum("ptv3_" in path.name for path in paths) == 2
 
 
 def test_installer_routes_every_generated_file_to_selected_artifact_root(tmp_path):
@@ -110,9 +119,9 @@ def test_installer_routes_every_generated_file_to_selected_artifact_root(tmp_pat
 
 
 def test_installer_only_supports_ddpm20():
-    assert parse_args([]).artifact_directory.name == "ddpm20"
+    assert parse_args([]).artifact_directory.name == "ddpm20-p3500-2048-1024-512-512"
     with pytest.raises(SystemExit):
-        parse_args(["--denoiser", "ddim"])
+        parse_args(["--denoiser", "unknown"])
 
 
 def test_cmake_build_places_library_in_python_discovery_directory(tmp_path):

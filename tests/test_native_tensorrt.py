@@ -46,7 +46,7 @@ def test_ddpm_only_supports_the_released_twenty_step_schedule():
 
 
 def test_native_runtime_rejects_unsupported_denoisers():
-    for denoiser in ("ddim", "unknown"):
+    for denoiser in ("unknown", "invalid"):
         with pytest.raises(ValueError, match="denoiser must"):
             NativeCppRuntime(denoiser=denoiser)
 
@@ -105,8 +105,8 @@ def test_failed_cpp_install_does_not_publish_partial_runtime(monkeypatch):
         raise RuntimeError("native construction failed")
 
     monkeypatch.setattr(install_module, "NativeCppRuntime", fail)
-    installed = install_module.install_fast_runtime(SimpleNamespace(model=model))
-    assert not installed
+    with pytest.raises(RuntimeError, match="native construction failed"):
+        install_module.install_fast_runtime(SimpleNamespace(model=model))
     assert not hasattr(model, "native_cpp_runtime")
 
 
@@ -197,4 +197,66 @@ def test_python_boundary_replays_cpp_runtime_deterministically():
     assert torch.all(second_result.confidence[:-1] >= second_result.confidence[1:])
     assert sorted(second_result.source_indices.cpu().tolist()) == list(range(150))
     assert not second_result.ptv3_topology_overflow.any()
+    assert len(runtime.stage_capacities) == 5
+    assert second_result.ptv3_stage_counts[0].item() == runtime.stage_capacities[0]
+    assert all(
+        count <= capacity
+        for count, capacity in zip(
+            second_result.ptv3_stage_counts.cpu().tolist(), runtime.stage_capacities
+        )
+    )
+    assert second_result.valid.dtype == torch.bool
+    assert second_result.valid.all()
+
+    # The C ABI must preserve the native volume check and count supplied points,
+    # without counting repetitions up to the encoder's input capacity.
+    points = points[:100].contiguous()
+    baseline = runtime.infer(
+        points, gripper, seed=7, sequence_offset=0
+    ).confidence.clone()
+    runtime.set_minimum_points_in_volume(1)
+    with pytest.raises(RuntimeError, match="volume"):
+        runtime.infer(points, gripper)
+    with pytest.raises(RuntimeError):
+        runtime.set_grasp_volume(np.zeros((2, 3), dtype=np.float32))
+    runtime.set_grasp_volume([[-100, -100, -100], [100, 100, 100]])
+    runtime.set_minimum_points_in_volume(100)
+    result = runtime.infer(points, gripper, seed=7, sequence_offset=0)
+    assert result.valid.all()
+    torch.testing.assert_close(result.confidence, baseline, atol=0, rtol=0)
+    runtime.set_minimum_points_in_volume(101)
+    result = runtime.infer(points, gripper, seed=7, sequence_offset=0)
+    assert not result.valid.any()
+    assert (result.confidence == 0).all()
+    runtime.set_grasp_volume([[1000, 1000, 1000], [1001, 1001, 1001]])
+    runtime.set_minimum_points_in_volume(1)
+    assert not runtime.infer(points, gripper).valid.any()
+    runtime.set_minimum_points_in_volume(0)
+    result = runtime.infer(points, gripper, seed=7, sequence_offset=0)
+    assert result.valid.all()
+    torch.testing.assert_close(result.confidence, baseline, atol=0, rtol=0)
     runtime.close()
+
+
+@pytest.mark.skipif(
+    not (
+        _RUN_NATIVE
+        and torch.cuda.is_available()
+        and _NATIVE_LIBRARY
+        and _NATIVE_ARTIFACTS
+    ),
+    reason="requires native library and artifact paths",
+)
+def test_native_runtime_rejects_inconsistent_encoder_plans(tmp_path):
+    source = Path(_NATIVE_ARTIFACTS)
+    for path in required_runtime_artifacts(source, diffusion_grasps=100, obb_grasps=50):
+        target = tmp_path / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        replacement = (
+            source / "engines/scorer_core_c150_fp32.plan"
+            if path.name == "ptv3_discriminator_fp16.plan"
+            else path
+        )
+        target.symlink_to(replacement.resolve())
+    with pytest.raises(RuntimeError, match="missing tensor.*neighbor_indices_k3"):
+        NativeCppRuntime(artifact_directory=tmp_path, library_path=_NATIVE_LIBRARY)

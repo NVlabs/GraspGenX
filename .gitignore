@@ -41,3 +41,6 @@ ext/*
 # end2end: generated merged robot URDFs/configs + run outputs (not committed)
 end2end/curobo_assets/
 end2end/runs/
+
+# Generated native model artifacts
+/cpp_runtime/artifacts/

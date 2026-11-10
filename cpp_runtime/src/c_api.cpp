@@ -77,7 +77,6 @@ graspgenx::RuntimeConfig MakeRuntimeConfig(
   native.gripper_depth = initial_gripper_depth;
   if (denoiser_type == GRASPGENX_DENOISER_DDPM) {
     native.denoiser = graspgenx::DenoiserType::kDdpm;
-
   } else {
     throw std::invalid_argument("unknown denoiser_type");
   }
@@ -98,23 +97,6 @@ void CreateRuntime(graspgenx::RuntimeConfig native,
 extern "C" {
 
 const char* graspgenx_runtime_last_error(void) { return g_last_error.c_str(); }
-
-int graspgenx_runtime_create(const graspgenx_runtime_c_config* config,
-                            graspgenx_runtime_handle* output) {
-  return Guard([&] {
-    if (config == nullptr) throw std::invalid_argument("config is null");
-    if (config->diffusion_steps != 20) {
-      throw std::invalid_argument(
-          "legacy DDPM config requires exactly 20 diffusion steps");
-    }
-    CreateRuntime(
-        MakeRuntimeConfig(config->artifact_directory,
-                          config->initial_gripper_depth,
-                          GRASPGENX_DENOISER_DDPM,
-                          config->diffusion_grasps, config->obb_grasps),
-        output);
-  });
-}
 
 int graspgenx_runtime_create_v2(const graspgenx_runtime_c_config_v2* config,
                                graspgenx_runtime_handle* output) {
@@ -153,6 +135,16 @@ int graspgenx_runtime_grasp_count(graspgenx_runtime_handle runtime,
   });
 }
 
+int graspgenx_runtime_stage_capacities(graspgenx_runtime_handle runtime,
+                                      int64_t* output_capacities_5) {
+  return Guard([&] {
+    if (output_capacities_5 == nullptr) throw std::invalid_argument("output is null");
+    const auto capacities = Get(runtime).runtime.stage_capacities();
+    for (std::size_t i = 0; i < capacities.size(); ++i)
+      output_capacities_5[i] = capacities[i];
+  });
+}
+
 int graspgenx_runtime_set_gripper_device_async(
     graspgenx_runtime_handle runtime,
     const void* generator_embedding_fp16_512,
@@ -163,6 +155,26 @@ int graspgenx_runtime_set_gripper_device_async(
     Get(runtime).runtime.SetGripperDeviceAsync(
         generator_embedding_fp16_512, discriminator_embedding_fp32_512,
         gripper_depth, static_cast<cudaStream_t>(stream));
+  });
+}
+
+int graspgenx_runtime_set_grasp_volume(graspgenx_runtime_handle runtime,
+                                     const float* bounds_6) {
+  return Guard([&] { Get(runtime).runtime.SetGraspVolume(bounds_6); });
+}
+
+int graspgenx_runtime_set_minimum_points_in_volume(
+    graspgenx_runtime_handle runtime, int minimum_points) {
+  return Guard([&] { Get(runtime).runtime.SetMinimumPointsInVolume(minimum_points); });
+}
+
+int graspgenx_runtime_copy_valid_async(graspgenx_runtime_handle runtime,
+                                     uint8_t* output_valid, void* stream) {
+  return Guard([&] {
+    if (output_valid == nullptr) throw std::invalid_argument("output is null");
+    const auto output = Get(runtime).runtime.outputs();
+    CopyOptional(output_valid, output.valid, output.grasp_count,
+                 static_cast<cudaStream_t>(stream), "copy output validity");
   });
 }
 

@@ -111,15 +111,12 @@ class GraspGenXSampler:
         if use_fast_inference and self.native_runtime is None:
             from graspgenx.fast_inference import install_fast_runtime
 
-            accelerated = install_fast_runtime(
+            install_fast_runtime(
                 self,
                 diffusion_grasps=self.diffusion_grasps,
                 obb_grasps=self.obb_grasps,
             )
-            if accelerated:
-                logger.info("Inference delegated to the native C++ runtime.")
-            else:
-                logger.warning("Fast inference not enabled; using eager PyTorch.")
+            logger.info("Inference delegated to the native C++ runtime.")
             self.native_runtime = getattr(model, "native_cpp_runtime", None)
         self.using_fast_inference = self.native_runtime is not None
         if self.using_fast_inference:

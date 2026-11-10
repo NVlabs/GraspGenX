@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export fixed-capacity PTV3 learned stages with topology as explicit inputs."""
+"""Export complete fixed-capacity PTV3 encoders with shared native topology inputs."""
 
 from __future__ import annotations
 
@@ -13,11 +13,19 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional
+from artifact_tools import layer_norm_fp32, gelu_fp32
+from ptv3_plugins import segment_max, valid_mean
 
 from graspgenx.models.grasp_gen import GraspGen
 from graspgenx.utils.checkpoint_io import load_model_cfg
 
-STAGE_CAPACITIES = (3500, 1536, 512, 128, 64)
+from graspgenx.fast_inference._profiles import (
+    DEFAULT_STAGE_CAPACITIES,
+    validate_stage_capacities,
+    write_stage_capacities,
+)
+
+STAGE_CAPACITIES = DEFAULT_STAGE_CAPACITIES
 ORDER_COUNT = 4
 
 
@@ -27,13 +35,16 @@ def _affine_batch_norm_parameters(batch_norm):
     return scale.detach(), shift.detach()
 
 
-class Ptv3StageGraph(nn.Module):
-    """One learned PTV3 stage between native topology/pooling boundaries."""
+class Ptv3Stage(nn.Module):
+    """Learned operations within one level of the encoder hierarchy."""
 
-    def __init__(self, encoder, stage_index):
+    def __init__(self, encoder, stage_index, capacities=None):
         super().__init__()
         self.stage_index = int(stage_index)
-        self.capacity = STAGE_CAPACITIES[self.stage_index]
+        self.capacities = validate_stage_capacities(
+            STAGE_CAPACITIES if capacities is None else capacities
+        )
+        self.capacity = self.capacities[self.stage_index]
         self.stage = encoder.enc._modules[f"enc{self.stage_index}"]
         self.blocks = nn.ModuleList(
             module
@@ -108,7 +119,7 @@ class Ptv3StageGraph(nn.Module):
         key_positions = torch.arange(self.patch_size, device=features.device)
         valid_keys = key_positions[None, :] < valid_key_counts[:, None]
         scores = scores.masked_fill(~valid_keys[:, None, None, :], -1.0e4)
-        probabilities = torch.softmax(scores, dim=-1)
+        probabilities = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
         attended = torch.matmul(probabilities, value)
         attended = attended.transpose(1, 2).reshape(-1, channels)
         return block.attn.proj(self._gather_rows(attended, inverse))
@@ -134,10 +145,10 @@ class Ptv3StageGraph(nn.Module):
                 self.embedding.conv.weight.flatten(0, 1),
             )
             features = features * self.input_norm_scale + self.input_norm_shift
-            features = functional.gelu(features, approximate="none")
+            features = gelu_fp32(features, approximate="none")
         else:
             features = features * self.input_norm_scale + self.input_norm_shift
-            features = functional.gelu(features, approximate="none")
+            features = gelu_fp32(features, approximate="none")
 
         for block_index, block in enumerate(self.blocks):
             shortcut = features
@@ -148,7 +159,7 @@ class Ptv3StageGraph(nn.Module):
                 getattr(self, f"cpe_weight_{block_index}"),
                 getattr(self, f"cpe_bias_{block_index}"),
             )
-            cpe = functional.layer_norm(
+            cpe = layer_norm_fp32(
                 cpe,
                 (int(block.channels),),
                 block.cpe_norm.weight,
@@ -158,7 +169,7 @@ class Ptv3StageGraph(nn.Module):
             features = shortcut + cpe
 
             shortcut = features
-            normalized = functional.layer_norm(
+            normalized = layer_norm_fp32(
                 features,
                 (int(block.channels),),
                 block.norm1.weight,
@@ -175,7 +186,7 @@ class Ptv3StageGraph(nn.Module):
             )
 
             shortcut = features
-            features = functional.layer_norm(
+            features = layer_norm_fp32(
                 features,
                 (int(block.channels),),
                 block.norm2.weight,
@@ -183,7 +194,7 @@ class Ptv3StageGraph(nn.Module):
                 block.norm2.eps,
             )
             features = block.mlp.fc1(features)
-            features = functional.gelu(features, approximate="none")
+            features = gelu_fp32(features, approximate="none")
             features = shortcut + block.mlp.fc2(features)
 
         if self.pool_projection is not None:
@@ -191,20 +202,32 @@ class Ptv3StageGraph(nn.Module):
         return features
 
 
-def parse_args():
+def parse_args(argv=None):
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--release-root",
         type=Path,
-        default=root / "ext/graspgenx_checkpoints/GraspGenXModel/release",
+        default=root / "ext/graspgenx_checkpoints/release",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=root / "cpp_runtime/artifacts/onnx/ptv3",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--ptv3-capacities",
+        nargs=5,
+        type=int,
+        default=DEFAULT_STAGE_CAPACITIES,
+        metavar=("INPUT", "POOL1", "POOL2", "POOL3", "POOL4"),
+    )
+    args = parser.parse_args(argv)
+    try:
+        args.ptv3_capacities = validate_stage_capacities(args.ptv3_capacities)
+    except ValueError as error:
+        parser.error(str(error))
+    return args
 
 
 def load_model(release_root):
@@ -214,10 +237,8 @@ def load_model(release_root):
     return model.eval()
 
 
-def synthetic_inputs(module):
+def synthetic_topology(module):
     capacity = module.capacity
-    channels = 3 if module.stage_index == 0 else int(module.blocks[0].channels)
-    features = torch.randn(capacity, channels, dtype=torch.float16)
     indices_k3 = torch.arange(capacity, dtype=torch.int64)[:, None].expand(capacity, 27)
     mask_k3 = torch.zeros(capacity, 27, dtype=torch.bool)
     mask_k3[:, 13] = True
@@ -241,7 +262,6 @@ def synthetic_inputs(module):
         mask_k5[:, 62] = True
     else:
         return (
-            features,
             indices_k3,
             mask_k3,
             orders,
@@ -249,7 +269,6 @@ def synthetic_inputs(module):
             valid_keys,
         )
     return (
-        features,
         indices_k3,
         mask_k3,
         orders,
@@ -260,28 +279,102 @@ def synthetic_inputs(module):
     )
 
 
-def export_stage(module, inputs, path):
+class Ptv3EncoderGraph(nn.Module):
+    """One complete encoder graph with native V3 reductions."""
+
+    def __init__(self, encoder, capacities):
+        super().__init__()
+        self.capacities = validate_stage_capacities(capacities)
+        self.stages = nn.ModuleList(Ptv3Stage(encoder, i, capacities) for i in range(5))
+        names = ["features"]
+        for i in range(5):
+            prefix = f"stage{i}_"
+            names.extend(
+                prefix + name
+                for name in (
+                    "neighbor_indices_k3",
+                    "neighbor_mask_k3",
+                    "attention_order",
+                    "attention_inverse",
+                    "valid_key_counts",
+                )
+            )
+            if i == 0:
+                names.extend(
+                    prefix + name
+                    for name in ("neighbor_indices_k5", "neighbor_mask_k5")
+                )
+            else:
+                names.append(prefix + "valid_count")
+            if i < 4:
+                names.extend(prefix + name for name in ("pool_order", "pool_index_ptr"))
+        self.input_names = tuple(names)
+
+    def forward(self, features, *topology):
+        values = dict(zip(self.input_names, (features, *topology)))
+        for i, stage in enumerate(self.stages):
+            prefix = f"stage{i}_"
+            names = [
+                "neighbor_indices_k3",
+                "neighbor_mask_k3",
+                "attention_order",
+                "attention_inverse",
+                "valid_key_counts",
+            ]
+            if i == 0:
+                names.extend(["neighbor_indices_k5", "neighbor_mask_k5"])
+            features = stage(features, *(values[prefix + name] for name in names))
+            if i < 4:
+                features = segment_max(
+                    features,
+                    values[prefix + "pool_order"],
+                    values[prefix + "pool_index_ptr"],
+                    values[f"stage{i+1}_valid_count"],
+                    self.capacities[i + 1],
+                )
+            else:
+                features = valid_mean(features, values[prefix + "valid_count"])
+        return features
+
+    def example_inputs(self):
+        values = {"features": torch.randn(self.capacities[0], 3, dtype=torch.float16)}
+        for i, stage in enumerate(self.stages):
+            prefix = f"stage{i}_"
+            example = synthetic_topology(stage)
+            names = [
+                "neighbor_indices_k3",
+                "neighbor_mask_k3",
+                "attention_order",
+                "attention_inverse",
+                "valid_key_counts",
+            ]
+            if i == 0:
+                names.extend(["neighbor_indices_k5", "neighbor_mask_k5"])
+            values.update((prefix + name, value) for name, value in zip(names, example))
+            if i > 0:
+                values[prefix + "valid_count"] = torch.tensor(
+                    [self.capacities[i]], dtype=torch.int64
+                )
+            if i < 4:
+                values[prefix + "pool_order"] = torch.arange(
+                    self.capacities[i], dtype=torch.int64
+                ).repeat(4, 1)
+                values[prefix + "pool_index_ptr"] = torch.linspace(
+                    0, self.capacities[i], self.capacities[i + 1] + 1, dtype=torch.int64
+                )
+        return tuple(values[name] for name in self.input_names)
+
+
+def export_encoder(module, path):
     import onnx
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     with torch.inference_mode():
-        expected = module(*inputs)
-        input_names = (
-            "features",
-            "neighbor_indices_k3",
-            "neighbor_mask_k3",
-            "attention_order",
-            "attention_inverse",
-            "valid_key_counts",
-        )
-        if module.stage_index == 0:
-            input_names += ("neighbor_indices_k5", "neighbor_mask_k5")
         torch.onnx.export(
             module,
-            inputs,
+            module.example_inputs(),
             path,
-            input_names=input_names,
-            output_names=("features_out",),
+            input_names=module.input_names,
+            output_names=("embedding",),
             opset_version=18,
             dynamo=True,
             external_data=False,
@@ -290,21 +383,20 @@ def export_stage(module, inputs, path):
         )
     graph = onnx.load(path, load_external_data=False)
     onnx.checker.check_model(graph)
-    gather_count = sum(node.op_type == "Gather" for node in graph.graph.node)
-    gather_nd_count = sum(node.op_type == "GatherND" for node in graph.graph.node)
-    if gather_nd_count:
-        raise RuntimeError(
-            f"{path} contains {gather_nd_count} GatherND nodes; "
-            "PTV3 row lookup must export as Gather"
-        )
+    if any(node.op_type == "GatherND" for node in graph.graph.node):
+        raise RuntimeError("PTV3 row lookup must export as Gather")
+    plugins = [
+        node.op_type for node in graph.graph.node if node.domain == "trt.plugins"
+    ]
+    if (
+        plugins.count("GraspGenXSegmentMax") != 4
+        or plugins.count("GraspGenXValidMean") != 1
+    ):
+        raise RuntimeError("Encoder must contain four pooling and one mean plugin")
     return {
         "path": str(path),
         "file_bytes": path.stat().st_size,
         "onnx_nodes": len(graph.graph.node),
-        "onnx_gather_nodes": gather_count,
-        "onnx_gather_nd_nodes": gather_nd_count,
-        "output_shape": list(expected.shape),
-        "output_finite": bool(torch.isfinite(expected).all()),
     }
 
 
@@ -316,19 +408,23 @@ def main():
         "generator": model.grasp_generator.object_encoder,
         "discriminator": model.grasp_discriminator.object_encoder,
     }
-    report = {"precision": "fp16", "graphs": {}}
-    for encoder_name, encoder in encoders.items():
+    report = {
+        "precision": "fp16",
+        "stage_capacities": args.ptv3_capacities,
+        "graphs": {},
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    for name, encoder in encoders.items():
+        # Fold CPE and normalization parameters in the encoder storage precision.
         encoder.half()
-        for stage_index in range(5):
-            name = f"ptv3_{encoder_name}_stage{stage_index}"
-            module = Ptv3StageGraph(encoder, stage_index).eval()
-            report["graphs"][name] = export_stage(
-                module,
-                synthetic_inputs(module),
-                args.output_dir / f"{name}.onnx",
-            )
-    report_path = args.output_dir / "export_report.json"
-    report_path.write_text(json.dumps(report, indent=2) + "\n")
+        module = Ptv3EncoderGraph(encoder, args.ptv3_capacities).half().eval()
+        report["graphs"][name] = export_encoder(
+            module, args.output_dir / f"ptv3_{name}.onnx"
+        )
+    write_stage_capacities(args.output_dir, args.ptv3_capacities)
+    (args.output_dir / "export_report.json").write_text(
+        json.dumps(report, indent=2) + "\n"
+    )
     print(json.dumps(report, indent=2))
 
 

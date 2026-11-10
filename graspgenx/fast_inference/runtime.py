@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import torch
 
@@ -70,21 +71,28 @@ def install_fast_runtime(
             raise ValueError(
                 f"shared model already has native runtime {active}; requested {requested}"
             )
+        requested_artifacts = artifact_directory or os.environ.get(
+            "GRASPGENX_CPP_RUNTIME_ARTIFACTS"
+        )
+        if (
+            requested_artifacts is not None
+            and Path(requested_artifacts).expanduser().resolve()
+            != existing.artifact_directory
+        ):
+            raise ValueError(
+                "shared model already has a native runtime with a different artifact directory/PTV3 profile"
+            )
         return True
 
     generator_device = next(model.grasp_generator.gripper_encoder.parameters()).device
-    try:
-        runtime = NativeCppRuntime(
-            artifact_directory=artifact_directory,
-            library_path=library_path,
-            diffusion_grasps=diffusion_grasps,
-            obb_grasps=obb_grasps,
-            denoiser=denoiser,
-            device=generator_device,
-        )
-    except Exception as error:  # noqa: BLE001 - eager fallback remains intact
-        logger.warning("Native C++ inference runtime was not applied: %s", error)
-        return False
+    runtime = NativeCppRuntime(
+        artifact_directory=artifact_directory,
+        library_path=library_path,
+        diffusion_grasps=diffusion_grasps,
+        obb_grasps=obb_grasps,
+        denoiser=denoiser,
+        device=generator_device,
+    )
 
     model.native_cpp_runtime = runtime
     model.optimized_diffusion_grasps = diffusion_grasps

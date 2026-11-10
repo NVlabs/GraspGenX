@@ -17,8 +17,14 @@ import tempfile
 from pathlib import Path
 
 from graspgenx._setup_dependencies import get_checkpoints_version_dir
-from graspgenx.fast_inference._constants import artifact_subdirectory
 from graspgenx.fast_inference.cpp_runtime import required_runtime_artifacts
+from graspgenx.fast_inference._profiles import (
+    DEFAULT_STAGE_CAPACITIES,
+    profile_artifact_subdirectory,
+    PROFILE_FILENAME,
+    read_stage_capacities,
+    validate_stage_capacities,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CPP_RUNTIME = _ROOT / "cpp_runtime"
@@ -84,6 +90,14 @@ def parse_args(argv=None):
         default="ddpm",
         help="sampling schedule to install (DDPM20)",
     )
+    parser.add_argument(
+        "--ptv3-capacities",
+        nargs=5,
+        type=int,
+        default=DEFAULT_STAGE_CAPACITIES,
+        metavar=("INPUT", "POOL1", "POOL2", "POOL3", "POOL4"),
+        help="static PTV3 capacities: input 100–3500, pooled stages 1–3500",
+    )
     parser.add_argument("--diffusion-grasps", type=int, default=100)
     parser.add_argument("--obb-grasps", type=int, default=50)
     parser.add_argument(
@@ -119,6 +133,10 @@ def parse_args(argv=None):
         "--dry-run", action="store_true", help="print commands without running them"
     )
     args = parser.parse_args(argv)
+    try:
+        args.ptv3_capacities = validate_stage_capacities(args.ptv3_capacities)
+    except ValueError as error:
+        parser.error(str(error))
     if args.diffusion_grasps < 1:
         parser.error("diffusion grasps must be positive")
     if args.obb_grasps < 0:
@@ -130,9 +148,8 @@ def parse_args(argv=None):
     if args.force_artifacts and args.skip_artifacts:
         parser.error("--force-artifacts and --skip-artifacts are mutually exclusive")
     if args.artifact_directory is None:
-        args.artifact_directory = (
-            _CPP_RUNTIME / "artifacts" / artifact_subdirectory(args.denoiser)
-        )
+        name = profile_artifact_subdirectory(args.denoiser, args.ptv3_capacities)
+        args.artifact_directory = _CPP_RUNTIME / "artifacts" / name
     return args
 
 
@@ -184,11 +201,13 @@ def _artifact_commands(args) -> list[list[str]]:
         ],
         [
             python,
-            str(_CPP_RUNTIME / "tools/export_ptv3_stages.py"),
+            str(_CPP_RUNTIME / "tools/export_ptv3_encoders.py"),
             "--release-root",
             release,
             "--output-dir",
             str(artifacts / "onnx/ptv3"),
+            "--ptv3-capacities",
+            *map(str, args.ptv3_capacities),
         ],
         [
             python,
@@ -205,6 +224,8 @@ def _artifact_commands(args) -> list[list[str]]:
         [
             python,
             str(_CPP_RUNTIME / "tools/build_engines.py"),
+            "--plugin-library",
+            str(args.library_directory.resolve() / "libgraspgenx_runtime.so"),
             "--onnx-dir",
             str(artifacts / "onnx"),
             "--output-dir",
@@ -277,6 +298,19 @@ def _import_build_dependencies():
         )
 
 
+def _cached_stage_capacities(artifact_directory: Path):
+    """Read the completed encoder profile.
+
+    An empty tuple marks an interrupted build; None means no cached plans.
+    """
+    engines = artifact_directory / "engines"
+    try:
+        profile = read_stage_capacities(engines)
+    except ValueError:
+        return ()
+    return profile
+
+
 def _missing_artifacts(args) -> list[Path]:
     required = required_runtime_artifacts(
         args.artifact_directory.resolve(),
@@ -284,7 +318,10 @@ def _missing_artifacts(args) -> list[Path]:
         obb_grasps=args.obb_grasps,
         denoiser=args.denoiser,
     )
-    return [path for path in required if not path.is_file()]
+    missing = [path for path in required if not path.is_file()]
+    if _cached_stage_capacities(args.artifact_directory) != args.ptv3_capacities:
+        missing.append(args.artifact_directory / "engines" / PROFILE_FILENAME)
+    return missing
 
 
 def _verify(args, library: Path):
@@ -304,6 +341,10 @@ def _verify(args, library: Path):
         seed=0,
     )
     try:
+        if runtime.stage_capacities != args.ptv3_capacities:
+            raise RuntimeError(
+                f"PTV3 plan profile {runtime.stage_capacities} differs from requested {args.ptv3_capacities}"
+            )
         coordinate = torch.linspace(-0.05, 0.05, 3500, device=runtime.device)
         points = torch.stack(
             (coordinate, 0.02 * torch.sin(97 * coordinate), coordinate.square()),
@@ -338,29 +379,23 @@ def main(argv=None):
     args.build_directory = args.build_directory.expanduser().resolve()
     args.library_directory = args.library_directory.expanduser().resolve()
     library = args.library_directory / "libgraspgenx_runtime.so"
+    cached_profile = _cached_stage_capacities(args.artifact_directory)
+    if (
+        cached_profile
+        and cached_profile != args.ptv3_capacities
+        and not args.force_artifacts
+    ):
+        raise ValueError(
+            f"PTV3 profile mismatch: found {cached_profile}, requested {args.ptv3_capacities}; "
+            "choose another --artifact-directory or use --force-artifacts"
+        )
     missing = _missing_artifacts(args)
 
     if args.skip_artifacts and missing:
         raise RuntimeError(
-            "--skip-artifacts requested, but runtime files are missing: "
+            "--skip-artifacts requested, but files are missing or the PTV3 profile differs: "
             + ", ".join(str(path) for path in missing)
         )
-    if not args.skip_artifacts and (args.force_artifacts or missing):
-        if not args.dry_run:
-            if (
-                not (args.release_root / "gen").is_dir()
-                or not (args.release_root / "dis").is_dir()
-            ):
-                raise FileNotFoundError(
-                    f"released generator/discriminator not found under {args.release_root}"
-                )
-            _import_build_dependencies()
-        print("Generating GPU-specific native runtime artifacts...", flush=True)
-        for command in _artifact_commands(args):
-            _run(command, dry_run=args.dry_run, verbose=args.verbose)
-    else:
-        print(f"Reusing complete artifacts: {args.artifact_directory}", flush=True)
-
     if args.skip_native_build:
         if not args.dry_run and not library.is_file():
             raise FileNotFoundError(
@@ -377,6 +412,22 @@ def main(argv=None):
         print("Building the native C++ runtime...", flush=True)
         for command in _cmake_commands(args, cmake):
             _run(command, dry_run=args.dry_run, verbose=args.verbose)
+
+    if not args.skip_artifacts and (args.force_artifacts or missing):
+        if not args.dry_run:
+            if (
+                not (args.release_root / "gen").is_dir()
+                or not (args.release_root / "dis").is_dir()
+            ):
+                raise FileNotFoundError(
+                    f"released generator/discriminator not found under {args.release_root}"
+                )
+            _import_build_dependencies()
+        print("Generating GPU-specific native runtime artifacts...", flush=True)
+        for command in _artifact_commands(args):
+            _run(command, dry_run=args.dry_run, verbose=args.verbose)
+    else:
+        print(f"Reusing complete artifacts: {args.artifact_directory}", flush=True)
 
     if args.dry_run:
         print("Dry run complete.")
@@ -402,6 +453,12 @@ def main(argv=None):
     print("Fast inference is ready.")
     print(f"  library:  {library}")
     print(f"  artifacts: {args.artifact_directory}")
+    print(f"  PTV3 capacities: {args.ptv3_capacities}")
+    print(
+        "  Select artifacts with GRASPGENX_CPP_RUNTIME_ARTIFACTS="
+        + shlex.quote(str(args.artifact_directory))
+        + " or the artifact_directory argument."
+    )
     return 0
 
 

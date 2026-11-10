@@ -8,7 +8,6 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace graspgenx::detail {
@@ -56,12 +55,10 @@ class UniqueCudaStream {
   cudaStream_t stream_{};
 };
 
-// A CUDA Runtime stream is created in the device's primary context. Keeping
-// this ownership in one value type gives Runtime a single execution-domain
-// seam. A future GreenDomain can be added to ExecutionDomainState without
-// changing pipeline code or introducing a virtual hierarchy.
-struct PrimaryDomain {
-  static PrimaryDomain Current() {
+// Own the primary CUDA context and its streams for one runtime instance.
+class ExecutionDomain {
+ public:
+  static ExecutionDomain Primary() {
     CheckDomainDriver(cuInit(0), "initialize CUDA driver");
     int device = 0;
     CheckDomainCuda(cudaGetDevice(&device), "cudaGetDevice execution domain");
@@ -76,13 +73,13 @@ struct PrimaryDomain {
       cuDevicePrimaryCtxRelease(driver_device);
       CheckDomainDriver(activation, "activate CUDA primary context");
     }
-    return PrimaryDomain(device, driver_device, context);
+    return ExecutionDomain(device, driver_device, context);
   }
 
-  PrimaryDomain(int device, CUdevice driver_device, CUcontext context)
-      : device(device), driver_device_(driver_device), context_(context) {}
+  ExecutionDomain(int device, CUdevice driver_device, CUcontext context)
+      : device_(device), driver_device_(driver_device), context_(context) {}
 
-  ~PrimaryDomain() {
+  ~ExecutionDomain() {
     if (context_ == nullptr) return;
     // Streams must be destroyed while their context is current and before the
     // primary-context retain is released.
@@ -91,14 +88,14 @@ struct PrimaryDomain {
     cuDevicePrimaryCtxRelease(driver_device_);
   }
 
-  PrimaryDomain(const PrimaryDomain&) = delete;
-  PrimaryDomain& operator=(const PrimaryDomain&) = delete;
-  PrimaryDomain(PrimaryDomain&& other) noexcept
-      : device(other.device),
+  ExecutionDomain(const ExecutionDomain&) = delete;
+  ExecutionDomain& operator=(const ExecutionDomain&) = delete;
+  ExecutionDomain(ExecutionDomain&& other) noexcept
+      : device_(other.device_),
         streams(std::move(other.streams)),
         driver_device_(other.driver_device_),
         context_(std::exchange(other.context_, nullptr)) {}
-  PrimaryDomain& operator=(PrimaryDomain&&) = delete;
+  ExecutionDomain& operator=(ExecutionDomain&&) = delete;
 
   cudaStream_t CreateStream(unsigned int flags = cudaStreamNonBlocking) {
     Activate();
@@ -131,48 +128,13 @@ struct PrimaryDomain {
     }
   }
 
-  int device = 0;
-  std::vector<UniqueCudaStream> streams;
+  int device() const noexcept { return device_; }
 
  private:
+  int device_ = 0;
+  std::vector<UniqueCudaStream> streams;
   CUdevice driver_device_{};
   CUcontext context_{};
-};
-
-using ExecutionDomainState = std::variant<PrimaryDomain>;
-
-class ExecutionDomain {
- public:
-  static ExecutionDomain Primary() {
-    return ExecutionDomain(PrimaryDomain::Current());
-  }
-
-  cudaStream_t CreateStream(unsigned int flags = cudaStreamNonBlocking) {
-    return std::visit(
-        [flags](auto& domain) { return domain.CreateStream(flags); }, state_);
-  }
-
-  void Activate() const {
-    std::visit([](const auto& domain) { domain.Activate(); }, state_);
-  }
-
-  void ActivateNoThrow() const noexcept {
-    std::visit([](const auto& domain) { domain.ActivateNoThrow(); }, state_);
-  }
-
-  void ValidateStream(cudaStream_t stream) const {
-    std::visit([stream](const auto& domain) { domain.ValidateStream(stream); },
-               state_);
-  }
-
-  int device() const noexcept {
-    return std::visit([](const auto& domain) { return domain.device; }, state_);
-  }
-
- private:
-  explicit ExecutionDomain(PrimaryDomain domain) : state_(std::move(domain)) {}
-
-  ExecutionDomainState state_;
 };
 
 }  // namespace graspgenx::detail

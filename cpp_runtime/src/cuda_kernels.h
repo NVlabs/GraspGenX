@@ -36,11 +36,6 @@ cudaError_t LaunchFinalizeSo3Fp16(
     const void* latent, float* matrices, void* canonical_rt,
     std::int64_t grasp_count, float kappa, cudaStream_t stream);
 
-cudaError_t LaunchObbTopdownFloat(
-    const float* points, std::int64_t point_count, float* matrices,
-    float* canonical_rt, float* bounds, float gripper_depth, float kappa,
-    std::int64_t grasp_count, cudaStream_t stream);
-
 cudaError_t LaunchObbTopdownFloatDeviceDepth(
     const float* points, std::int64_t point_count, float* matrices,
     float* canonical_rt, float* bounds, const float* gripper_depth, float kappa,
@@ -50,16 +45,11 @@ cudaError_t LaunchSegmentMaxFp16(
     const void* features, const std::int64_t* indices,
     const std::int64_t* index_ptr, const std::int64_t* segment_count,
     void* output, std::int64_t output_capacity, std::int64_t channels,
-    cudaStream_t stream);
+    std::int64_t input_capacity, cudaStream_t stream);
 
 cudaError_t LaunchMeanFp16(
     const void* features, const std::int64_t* valid_count, void* output,
-    std::int64_t channels, cudaStream_t stream);
-
-cudaError_t LaunchFilterResampleFloat(
-    const float* points, std::int64_t point_count, std::int64_t output_count,
-    float threshold, bool* keep, std::int64_t* selected_indices,
-    std::int32_t* selected_count, float* output, cudaStream_t stream);
+    std::int64_t channels, std::int64_t input_capacity, cudaStream_t stream);
 
 cudaError_t LaunchFilterResampleDynamicFloat(
     const float* points, const std::int64_t* point_count,

@@ -1,6 +1,9 @@
 # End-to-End Demos
 
-This `README` gives examples of using GraspGenX in a end-to-end application, using a Motion Planner (curobo) and evaluated on a physics simulator (Newton). One can also use it to generate Synthetic Data Generation (SDG) for Vision-Language-Action (VLA) training. In these examples, the simulator and GraspGenX model uses the complete object mesh point cloud, but it can be extended to using using RGB-D observations from the simulator and using SAM segmentation.
+These demos combine GraspGenX grasp generation, cuRobo motion planning, and
+Newton/MuJoCo simulation. They use complete object meshes to sample the point
+clouds supplied to GraspGenX and export trajectories for visualization and
+Vision-Language-Action training data.
 
 **GraspGenX** predicts grasps on each object → **cuRobo** plans a
 collision-free arm trajectory to a collision-free grasp → **Newton/MuJoCo**
@@ -20,7 +23,6 @@ The pipeline needs a heavier sim/planning stack than the base GraspGenX
 inference install. It lives in an optional extra:
 
 ```bash
-uv sync --extra fast-inference  # native C++ GraspGenX inference
 uv sync --extra end2end    # + cuRobo, Newton
 python end2end/setup_end2end_deps.py   # cuRobo assets into ext/ + UR10e arx_x5 URDF
 ```

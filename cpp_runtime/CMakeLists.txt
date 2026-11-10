@@ -33,7 +33,8 @@ get_filename_component(
 
 add_library(
   graspgenx_runtime SHARED
-  src/ptv3_cuda_kernel.cu
+  src/ptv3_plugins.cpp
+  src/cuda_kernels.cu
   src/grasp_volume.cu
   src/c_api.cpp
   src/runtime.cpp

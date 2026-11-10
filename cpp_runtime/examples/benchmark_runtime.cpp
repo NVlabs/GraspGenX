@@ -3,6 +3,7 @@
 
 #include "graspgenx/runtime.h"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -132,6 +133,10 @@ int main(int argc, char** argv) {
                          stream);
     }
     Check(cudaStreamSynchronize(stream), "warmup");
+    const char* capture_text = std::getenv("GRASPGENX_BENCHMARK_CAPTURE_RANGE");
+    const bool capture_range =
+        capture_text != nullptr && std::string(capture_text) == "1";
+    if (capture_range) Check(cudaProfilerStart(), "start profiler capture");
     Check(cudaEventRecord(start, stream), "record start");
     for (int iteration = 0; iteration < benchmark_iterations; ++iteration) {
       runtime.InferAsync(kPointCount, 7,
@@ -140,6 +145,7 @@ int main(int argc, char** argv) {
     }
     Check(cudaEventRecord(stop, stream), "record stop");
     Check(cudaEventSynchronize(stop), "synchronize stop");
+    if (capture_range) Check(cudaProfilerStop(), "stop profiler capture");
     float milliseconds = 0.0F;
     Check(cudaEventElapsedTime(&milliseconds, start, stop), "elapsed time");
     const auto profile = runtime.Profile(benchmark_iterations,

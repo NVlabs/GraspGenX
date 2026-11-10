@@ -21,18 +21,7 @@ enum {
   GRASPGENX_DENOISER_DDPM = 0,
 };
 
-typedef struct graspgenx_runtime_c_config {
-  const char* artifact_directory;
-  float initial_gripper_depth;
-  int diffusion_steps;
-  int diffusion_grasps;
-  int obb_grasps;
-} graspgenx_runtime_c_config;
-
-// Size-tagged extension that adds denoiser selection without changing the
-// original C ABI. The denoiser selects its fixed step count: DDPM20.
-// graspgenx_runtime_create() continues to select DDPM20 and validates the
-// legacy diffusion_steps field.
+// Size-tagged configuration for the fixed DDPM20 native runtime.
 typedef struct graspgenx_runtime_c_config_v2 {
   size_t struct_size;
   const char* artifact_directory;
@@ -45,9 +34,6 @@ typedef struct graspgenx_runtime_c_config_v2 {
 // Every fallible function returns zero on success. On failure, the returned
 // nonzero status can be expanded with graspgenx_runtime_last_error().
 GRASPGENX_C_API const char* graspgenx_runtime_last_error(void);
-GRASPGENX_C_API int graspgenx_runtime_create(
-    const graspgenx_runtime_c_config* config,
-    graspgenx_runtime_handle* output);
 GRASPGENX_C_API int graspgenx_runtime_create_v2(
     const graspgenx_runtime_c_config_v2* config,
     graspgenx_runtime_handle* output);
@@ -58,6 +44,19 @@ GRASPGENX_C_API int graspgenx_runtime_device(
     graspgenx_runtime_handle runtime, int* output_device);
 GRASPGENX_C_API int graspgenx_runtime_grasp_count(
     graspgenx_runtime_handle runtime, int* output_count);
+// Host output array of five int64 values.
+GRASPGENX_C_API int graspgenx_runtime_stage_capacities(
+    graspgenx_runtime_handle runtime, int64_t* output_capacities_5);
+
+// Host bounds [xmin,ymin,zmin,xmax,ymax,zmax]. Controls wait for prior inference.
+GRASPGENX_C_API int graspgenx_runtime_set_grasp_volume(
+    graspgenx_runtime_handle runtime, const float* bounds_6);
+GRASPGENX_C_API int graspgenx_runtime_set_minimum_points_in_volume(
+    graspgenx_runtime_handle runtime, int minimum_points);
+// Copy the last inference's validity mask to CUDA uint8 [grasp_count] storage.
+// Enqueue on the inference stream before submitting another inference.
+GRASPGENX_C_API int graspgenx_runtime_copy_valid_async(
+    graspgenx_runtime_handle runtime, uint8_t* output_valid, void* stream);
 
 GRASPGENX_C_API int graspgenx_runtime_set_gripper_device_async(
     graspgenx_runtime_handle runtime,

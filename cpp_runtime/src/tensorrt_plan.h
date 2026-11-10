@@ -6,7 +6,9 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <string>
 
@@ -36,8 +38,12 @@ class TensorRtPlan {
   void Bind(const char* name, void* address);
   void Enqueue(cudaStream_t stream);
   std::size_t device_memory_bytes() const noexcept;
+  nvinfer1::Dims Shape(const char* name) const;
+  void CheckTensor(const char* name, std::initializer_list<std::int64_t> shape,
+                   nvinfer1::DataType type, bool output = false) const;
 
  private:
+  std::filesystem::path path_;
   Logger logger_;
   std::unique_ptr<nvinfer1::IRuntime, TensorRtDeleter<nvinfer1::IRuntime>> runtime_;
   std::unique_ptr<nvinfer1::ICudaEngine,

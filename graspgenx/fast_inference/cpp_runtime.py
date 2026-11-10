@@ -18,13 +18,20 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from graspgenx._constants import MIN_OBJECT_POINT_COUNT
-from graspgenx.fast_inference._constants import artifact_subdirectory, denoising_steps
+from graspgenx.fast_inference._constants import denoising_steps
+from graspgenx.fast_inference._profiles import (
+    DEFAULT_STAGE_CAPACITIES,
+    profile_artifact_subdirectory,
+)
 
 ENGINE_POINT_COUNT = 3500
 _ROOT = Path(__file__).resolve().parents[2]
+_RUNTIME_LIBRARY_HANDLES: dict[Path, ctypes.CDLL] = {}
+
 _LIBRARY_ENV = "GRASPGENX_CPP_RUNTIME_LIBRARY"
 _ARTIFACT_ENV = "GRASPGENX_CPP_RUNTIME_ARTIFACTS"
 
@@ -84,7 +91,9 @@ def resolve_artifact_directory(
     directory = (
         Path(value).expanduser()
         if value is not None
-        else _ROOT / "cpp_runtime/artifacts" / artifact_subdirectory(denoiser)
+        else _ROOT
+        / "cpp_runtime/artifacts"
+        / profile_artifact_subdirectory(denoiser, DEFAULT_STAGE_CAPACITIES)
     ).resolve()
     required = required_runtime_artifacts(
         directory,
@@ -137,9 +146,8 @@ def required_runtime_artifacts(
     weights = directory / "weights"
     schedule = weights / "schedules" / str(denoising_steps(denoiser))
     ptv3_plans = tuple(
-        engines / "ptv3" / f"ptv3_{branch}_stage{stage}_fp16.plan"
+        engines / "ptv3" / f"ptv3_{branch}_fp16.plan"
         for branch in ("generator", "discriminator")
-        for stage in range(5)
     )
     return (
         *ptv3_plans,
@@ -201,6 +209,9 @@ def _configure_library(library):
         ctypes.POINTER(ctypes.c_int),
     ]
     library.graspgenx_runtime_grasp_count.restype = ctypes.c_int
+    capacities = library.graspgenx_runtime_stage_capacities
+    capacities.argtypes = [void_p, ctypes.POINTER(ctypes.c_int64)]
+    capacities.restype = ctypes.c_int
     library.graspgenx_runtime_set_gripper_device_async.argtypes = [
         void_p,
         void_p,
@@ -225,6 +236,18 @@ def _configure_library(library):
         void_p,
     ]
     library.graspgenx_runtime_infer_device_async.restype = ctypes.c_int
+    library.graspgenx_runtime_set_grasp_volume.argtypes = [
+        void_p,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    library.graspgenx_runtime_set_grasp_volume.restype = ctypes.c_int
+    library.graspgenx_runtime_set_minimum_points_in_volume.argtypes = [
+        void_p,
+        ctypes.c_int,
+    ]
+    library.graspgenx_runtime_set_minimum_points_in_volume.restype = ctypes.c_int
+    library.graspgenx_runtime_copy_valid_async.argtypes = [void_p, void_p, void_p]
+    library.graspgenx_runtime_copy_valid_async.restype = ctypes.c_int
     return library
 
 
@@ -244,6 +267,7 @@ class NativeInferenceResult:
     obb_bounds: torch.Tensor
     ptv3_stage_counts: torch.Tensor
     ptv3_topology_overflow: torch.Tensor
+    valid: torch.Tensor
 
 
 class NativeCppRuntime:
@@ -264,6 +288,7 @@ class NativeCppRuntime:
         device: int | torch.device | None = None,
         seed: int | None = None,
         denoiser: str = "ddpm",
+        minimum_points_in_volume: int = 0,
     ):
         self.diffusion_grasps = int(diffusion_grasps)
         self.obb_grasps = int(obb_grasps)
@@ -295,7 +320,13 @@ class NativeCppRuntime:
             denoiser=self.denoiser,
         )
         self.library_path = resolve_runtime_library(library_path)
-        self._library = _configure_library(ctypes.CDLL(str(self.library_path)))
+        # TensorRT's global creator registry retains pointers into this DSO.
+        # Keep it loaded even after the last runtime instance is closed.
+        if self.library_path not in _RUNTIME_LIBRARY_HANDLES:
+            _RUNTIME_LIBRARY_HANDLES[self.library_path] = ctypes.CDLL(
+                str(self.library_path)
+            )
+        self._library = _configure_library(_RUNTIME_LIBRARY_HANDLES[self.library_path])
         self._handle = ctypes.c_void_p()
         config = _ConfigV2(
             ctypes.sizeof(_ConfigV2),
@@ -319,6 +350,14 @@ class NativeCppRuntime:
             ),
             "query native runtime device",
         )
+        native_capacities = (ctypes.c_int64 * 5)()
+        self._check(
+            self._library.graspgenx_runtime_stage_capacities(
+                self._handle, native_capacities
+            ),
+            "query PTV3 capacities",
+        )
+        self.stage_capacities = tuple(native_capacities)
         self.device = torch.device("cuda", native_device.value)
         self.grasp_count = self.diffusion_grasps + self.obb_grasps
         native_count = ctypes.c_int(-1)
@@ -348,11 +387,36 @@ class NativeCppRuntime:
             ptv3_topology_overflow=torch.empty(
                 4, device=self.device, dtype=torch.uint8
             ),
+            valid=torch.empty(self.grasp_count, device=self.device, dtype=torch.bool),
         )
         self.seed = int(torch.initial_seed() if seed is None else seed) & (
             (1 << 64) - 1
         )
         self.sequence_offset = 0
+        self.set_minimum_points_in_volume(minimum_points_in_volume)
+
+    def set_grasp_volume(self, bounds):
+        """Set host FP32 [2,3] capture bounds, including gripper standoff."""
+        values = np.ascontiguousarray(bounds, dtype=np.float32)
+        if values.shape != (2, 3):
+            raise ValueError("grasp volume bounds must have shape [2,3]")
+        self._check(
+            self._library.graspgenx_runtime_set_grasp_volume(
+                self._handle, values.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            ),
+            "set grasp volume",
+        )
+
+    def set_minimum_points_in_volume(self, minimum_points: int):
+        minimum_points = int(minimum_points)
+        if not 0 <= minimum_points <= ENGINE_POINT_COUNT:
+            raise ValueError("minimum_points_in_volume must be in [0,3500]")
+        self._check(
+            self._library.graspgenx_runtime_set_minimum_points_in_volume(
+                self._handle, minimum_points
+            ),
+            "set minimum points in volume",
+        )
 
     def close(self):
         handle = getattr(self, "_handle", None)
@@ -456,6 +520,12 @@ class NativeCppRuntime:
                 stream_pointer,
             ),
             "native device inference",
+        )
+        self._check(
+            self._library.graspgenx_runtime_copy_valid_async(
+                self._handle, self._pointer(output.valid), stream_pointer
+            ),
+            "copy native validity",
         )
         if sequence_offset is None:
             random_pairs = self.denoising_steps * self.diffusion_grasps * 3

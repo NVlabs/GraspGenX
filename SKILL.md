@@ -15,8 +15,7 @@ description: >-
 
 GraspGenX is a **cross-embodiment** grasp model: one model, conditioned on a
 gripper's *swept volume*, predicts 6-DOF grasps for **any** gripper — including
-grippers unseen in training. (GraspGen, the predecessor, trained one model per
-gripper; GraspGenX does not.) Output is a set of `(K, 4, 4)` SE(3) grasp poses
+grippers unseen in training. Output is a set of `(K, 4, 4)` SE(3) grasp poses
 plus `(K,)` confidence scores; higher score = better, and visualizers color
 grasps red→green by score.
 
@@ -77,11 +76,28 @@ Python >= 3.10. `pip install -e .` also works inside a conda or venv. Add the
 | Command | Adds |
 |---------|------|
 | `uv sync --extra serve` | ZMQ client-server (`pyzmq`, `msgpack`, `msgpack-numpy`) |
-| `uv sync --extra fast-inference` | Native C++ one-object fast-inference runtime |
+| `uv sync --extra fast-inference` | Build dependencies for the native C++ runtime |
 | `uv sync --extra training` | Training and dataset utilities |
 | `uv sync --extra visualization` | Viser demos and offline rendering |
 | `uv sync --extra end2end` | cuRobo + Newton/MuJoCo + CoACD + USD + fcl (pick-and-place) |
 | `uv sync --extra dev` | `black`, `isort`, `flake8` |
+
+### Native inference
+
+Build the shared library and plans on the target GPU:
+
+```bash
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
+    --diffusion-grasps 100 --obb-grasps 50
+```
+
+The optimized runtime is implemented in `cpp_runtime/`; Python calls its C ABI.
+It uses DDPM20, 100 diffusion + 50 OBB candidates, and capacities
+`[3500,2048,1024,512,512]` by default. Custom counts and
+`--ptv3-capacities INPUT POOL1 POOL2 POOL3 POOL4` require matching plans.
+See [Fast inference](FAST_INFERENCE.md) for the supported input and execution
+contract. Add `--fast-inference --num_grasps 100` to the point-cloud demos to
+use the plans built above.
 
 ### Docker (training + inference)
 
@@ -103,7 +119,7 @@ For headless rendering (no display) in Docker or over SSH, prefix commands with
 
 ---
 
-## 2. Inference — the mental model
+## 2. Inference inputs and controls
 
 Every inference picks three things:
 
@@ -165,9 +181,8 @@ uv run python scripts/demo_scene_pc.py \
 
 Collision filtering is **on by default**; disable with `--no-filter_collisions`.
 `--scene 00` restricts to a single `real_world` scene. `--plot_top_mesh` is on by
-default here (`--no-plot_top_mesh` to disable). Related:
-`demo_scene_pc_fused.py` runs generation + scoring through one fused TensorRT
-engine (diffusion-only, requires CUDA).
+default here (`--no-plot_top_mesh` to disable). Add `--fast-inference` to use
+the shared native runtime, with `--num_grasps` matching the installed plans.
 
 ### `demo_object_mesh.py` — object meshes
 
@@ -274,18 +289,13 @@ reject `gripper_name`/`grasp_threshold`/`topk` on the wire — the client applie
 thresholding/top-k. `health` → `{"status":"ok"}`; `metadata` → default/loaded
 grippers + model config.
 
-### CLI client and worked examples
+### CLI client
 
 ```bash
 # General CLI client (mesh or point cloud → grasps, optional viser):
 uv run python client-server/graspgenx_client.py \
     --mesh_file assets/sample_data/object_mesh/box.obj --gripper_name franka_panda \
     --host localhost --port 5556 --visualize
-
-# Three mode examples (run the server first, then in a second terminal):
-uv run python scripts/client_server_example_1.py --gripper_name robotiq_2f_85 --port 5556  # scene depth
-uv run python scripts/client_server_example_2.py --gripper_name robotiq_2f_85 --port 5556  # scene PC
-uv run python scripts/client_server_example_3.py --gripper_name robotiq_2f_85 --port 5556  # single object
 ```
 
 ### Python API
@@ -387,14 +397,9 @@ approach→grasp→lift trajectory to a reachable, collision-free grasp →
 ### Install
 
 ```bash
-uv sync --extra fast-inference          # native C++ fast inference
-uv sync --extra end2end                 # + cuRobo, Newton/MuJoCo, CoACD, USD, fcl
+uv sync --extra end2end                 # cuRobo, Newton/MuJoCo, CoACD, USD, fcl
 python end2end/setup_end2end_deps.py    # clones cuRobo source into ext/curobo, builds merged URDFs
 ```
-
-> Note: an older pyproject comment mentions sibling `../curobo` / `../newton`
-> checkouts and a `[tool.uv.sources]` index — those are stale. The real path is
-> the `--extra end2end` install **plus** `setup_end2end_deps.py` (idempotent).
 
 ### Run a demo (from repo root, headless)
 

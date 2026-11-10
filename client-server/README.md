@@ -15,7 +15,7 @@ Unlike GraspGen (single gripper per server), GraspGenX loads a **single cross-em
 
 ## Three Modes of Use
 
-Beyond the legacy name-based `infer` action, the server exposes three
+Beyond the name-based `infer` action, the server exposes three
 **sweep-volume-params** modes — the gripper is described by 12 raw numbers per
 request, so the server needs no assets for it:
 
@@ -28,8 +28,8 @@ request, so the server needs no assets for it:
 Instance mask semantics (modes 2–3): the pixel/point value is the instance id;
 `0` means background/ignore. The server returns **all** generated grasps with
 scores; thresholding/top-k happen client-side. See
-[Example Scripts](#example-scripts-with-viser-visualization) for runnable,
-visualized versions of each mode.
+[Example Scripts](#example-scripts-with-viser-visualization) for a runnable
+visualized client, or [Python Client API](#python-client-api) for calls in each mode.
 
 ## Install
 
@@ -42,8 +42,18 @@ uv pip install pyzmq msgpack msgpack-numpy
 uv sync --extra serve
 ```
 
-Add `--extra fast-inference` to the `uv sync` command when the server should use
-the native C++ runtime.
+For the native C++ runtime, install the build dependencies and build the
+DDPM20 plans and shared library on the server's GPU:
+
+```bash
+uv sync --extra serve --extra fast-inference
+uv run --quiet --extra serve --extra fast-inference graspgenx-install-fast-inference \
+    --diffusion-grasps 100 --obb-grasps 50
+```
+
+Start the server with `--fast-inference` and request matching candidate counts.
+The default PTV3 profile is `[3500,2048,1024,512,512]`; see the
+[native runtime guide](../cpp_runtime/README.md) for configuration and limits.
 
 The client-side machine only needs `pyzmq`, `msgpack`, `msgpack-numpy`, `numpy`, and `trimesh` — no PyTorch or CUDA.
 
@@ -53,7 +63,7 @@ The client-side machine only needs `pyzmq`, `msgpack`, `msgpack-numpy`, `numpy`,
 # Activate the GraspGenX uv venv first.
 python client-server/graspgenx_server.py \
     --config <repo>/ext/graspgenx_checkpoints/release \
-    --assets_dir <repo>/assets \
+    --assets_dir <repo>/ext/gripper_descriptions/assets \
     --default_gripper franka_panda \
     --port 5556
 ```
@@ -69,12 +79,14 @@ python client-server/graspgenx_server.py \
 python client-server/graspgenx_client.py \
     --mesh_file /path/to/box.obj --mesh_scale 1.0 \
     --gripper_name franka_panda \
+    --num_grasps 100 \
     --host localhost --port 5556
 
 # Or from a point cloud file (.pcd / .ply / .xyz / .npy):
 python client-server/graspgenx_client.py \
-    --pcd_file assets/sample_data/object_mesh/banana.obj \
+    --pcd_file /path/to/object.npy \
     --gripper_name robotiq_2f_140 \
+    --num_grasps 100 \
     --host localhost --port 5556
 
 # Params-only mode 1 (no gripper assets on the server) — pass raw
@@ -82,6 +94,7 @@ python client-server/graspgenx_client.py \
 python client-server/graspgenx_client.py \
     --mesh_file /path/to/box.obj \
     --sweep_volume_json /path/to/sweep_params.json \
+    --num_grasps 100 \
     --host localhost --port 5556
 
 # Add --visualize to render the result in a viser web viewer at :8080.
@@ -102,7 +115,7 @@ with GraspGenXClient(host="localhost", port=5556) as client:
     #     "generator_backbone": "ptv3vanilla",
     #     "discriminator_backbone": "ptv3vanilla",
     #     "grasp_repr": "r3_so3",
-    #     "num_diffusion_iters_eval": 10,
+    #     "num_diffusion_iters_eval": ...,  # checkpoint configuration
     #   },
     #   "assets_dir": "/.../graspgenx/assets",
     # }
@@ -175,7 +188,7 @@ with GraspGenXClient(host="localhost", port=5556) as client:
 
 Notes:
 
-- These actions are **params-only** — pass `gripper_name` to the legacy
+- These actions are **params-only** — pass `gripper_name` to the
   `infer` action instead if you want name-based lookup.
 - `planner="graspmoe"` (default) unions diffusion samples with OBB-swept
   candidates, all scored by the discriminator; per-grasp provenance is
@@ -183,11 +196,11 @@ Notes:
 - **The server returns every generated grasp with its score.** The
   `grasp_threshold` / `topk_num_grasps` arguments of the Python client are
   applied **client-side**; raw-wire callers must threshold themselves (the
-  server rejects those fields on the new actions).
+  server rejects those fields on these actions).
 - The server runs eager PyTorch **fp32** by default. The native C++ runtime is
   enabled with `graspgenx_server.py --fast-inference`; it runs
   the default released 20-step DDPM trajectory as one CUDA Graph and
-  installs the combined dual-PTV3 CUDA runtime plus the native TensorRT scorer.
+  uses four TensorRT plans for both complete PTV3 encoders, denoising, and scoring.
   PointNet2 and Torch-TensorRT are not required.
   The `metadata` response reports the active precision under `"precision"`.
 - Instances with fewer than `min_object_points` (default 100) valid points,
@@ -197,40 +210,32 @@ Notes:
 
 ## Example Scripts (with viser visualization)
 
-`scripts/client_server_example_{1,2,3}.py` run one mode each against a live
-server on the shipped sample scenes and render the results in a
-[viser](https://viser.studio/) web viewer (grasps colored red→green by score,
-grouped per object under `obj/<label>/grasps/{diff,obb}_*` in the scene tree).
+`client-server/graspgenx_client.py` runs single-object inference against a live
+server and renders the results in a
+[viser](https://viser.studio/) web viewer (grasps colored red→green by score).
+Use the [Python Client API](#sweep-volume-params-api-no-gripper-assets-needed)
+for scene depth and scene point-cloud requests.
 
 ```bash
 # Terminal 1 — start the server with the native C++ fast runtime:
-uv run python client-server/graspgenx_server.py \
-    --config ext/graspgenx_checkpoints/release --assets_dir assets --port 5556 \
+uv run --extra serve --extra fast-inference python client-server/graspgenx_server.py \
+    --config ext/graspgenx_checkpoints/release \
+    --assets_dir ext/gripper_descriptions/assets --port 5556 \
     --fast-inference
 
-# Terminal 2 — run a mode, then open the URL the script prints:
-
-# Mode 1 (example 3) — single segmented object point cloud:
-uv run python scripts/client_server_example_3.py --gripper_name robotiq_2f_85 --port 5556
-
-# Mode 2 (example 1) — scene depth image + intrinsics + instance mask:
-uv run python scripts/client_server_example_1.py --gripper_name robotiq_2f_85 --port 5556
-
-# Mode 3 (example 2) — scene point cloud + instance mask:
-uv run python scripts/client_server_example_2.py --gripper_name robotiq_2f_85 --port 5556
+# Terminal 2 — run the client, then open the URL it prints:
+uv run --extra serve --extra visualization python client-server/graspgenx_client.py \
+    --mesh_file assets/sample_data/object_mesh/banana.obj \
+    --gripper_name robotiq_2f_85 --num_grasps 100 --port 5556 --visualize
 ```
 
-`--gripper_name` is resolved to sweep-volume params **locally** (only the 12
-numbers travel over the wire); pass `--sweep_volume_json file.json` instead
-for a gripper with no local assets. Common flags:
+`--gripper_name` selects a gripper from the server's assets; pass
+`--sweep_volume_json file.json` instead for a gripper described by raw params.
+Common flags:
 
-- `--scene_dir assets/sample_data/real_world/01` — the other shipped scene.
-- `--grasp_threshold 0.7` (default, client-side; `-1.0` disables) and
-  `--topk_num_grasps 100` (default; `-1` keeps everything the server sent).
-- `--planner diffusion` (default `graspmoe`) and
-  `--moe_obb_density dense-topandside` for a denser OBB sweep.
-- Example 3 only: `--object_index N` picks the object;
-  `--pcd_npy cloud.npy` sends your own (N,3) point cloud.
+- `--grasp_threshold 0.7` (client-side; `-1.0` disables) and
+  `--topk_num_grasps 100` (`-1` keeps everything the server sent).
+- `--pcd_file cloud.npy` sends your own (N,3) point cloud instead of a mesh.
 
 ## Supported Grippers
 

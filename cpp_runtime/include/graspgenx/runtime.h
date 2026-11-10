@@ -4,6 +4,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -69,6 +70,8 @@ struct RuntimeProfile {
 
 class Runtime {
  public:
+  // Maximum staging/input normalization count. The neural input shape is
+  // selected by the loaded PTV3 plans (100 through 3500).
   static constexpr std::int64_t kEnginePointCount = 3500;
   static constexpr std::int64_t kMinimumPointCount = 100;
 
@@ -105,8 +108,8 @@ class Runtime {
   float* device_input_points() noexcept;
 
   // Variable-count input. At least 100 points are required. Inputs below
-  // 3500 are filtered and repeated to the fixed engine shape; larger inputs
-  // are deterministically downsampled to 3500 before filtering. Device and
+  // 3500 are filtered and resampled to the encoder input capacity; larger
+  // inputs are deterministically downsampled to 3500 before filtering. Device and
   // host pointers are contiguous FP32 [point_count,3] arrays.
   void InferAsync(std::int64_t point_count, std::uint64_t seed,
                   std::uint64_t sequence_offset, cudaStream_t stream);
@@ -120,6 +123,8 @@ class Runtime {
   DeviceOutputs outputs() const noexcept;
   RuntimeMemory memory() const noexcept;
   int device() const noexcept;
+  // Static plan capacities, discovered and validated at construction.
+  std::array<std::int64_t, 5> stage_capacities() const noexcept;
   RuntimeProfile Profile(int warmup_iterations = 100,
                          int measured_iterations = 1000);
 

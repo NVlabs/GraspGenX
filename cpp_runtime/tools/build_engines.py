@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import platform
 import sys
@@ -27,6 +28,13 @@ try:
     import tensorrt as trt
 except ModuleNotFoundError:
     import tensorrt_bindings as trt
+
+from graspgenx.fast_inference._profiles import (
+    PROFILE_FILENAME,
+    read_stage_capacities,
+    validate_stage_capacities,
+    write_stage_capacities,
+)
 
 GRAPH_PRECISIONS = {
     "denoiser_core": "fp16",
@@ -50,6 +58,7 @@ def parse_args(argv=None):
         type=Path,
         default=root / "cpp_runtime/artifacts/engines",
     )
+    parser.add_argument("--plugin-library", type=Path, required=True)
     parser.add_argument("--diffusion-grasps", type=int, default=100)
     parser.add_argument("--obb-grasps", type=int, default=50)
     parser.add_argument(
@@ -71,17 +80,22 @@ def build_engine(
 ):
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
-    explicit_batch = getattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH", None)
-    strongly_typed = getattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED", None)
-    if explicit_batch is not None:
-        network_flags = 1 << int(explicit_batch)
-    else:
-        network_flags = 0 if strongly_typed is None else 1 << int(strongly_typed)
+    network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
     network = builder.create_network(network_flags)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(str(onnx_path)):
         errors = [str(parser.get_error(index)) for index in range(parser.num_errors)]
         raise RuntimeError("ONNX parse failed:\n" + "\n".join(errors))
+
+    input_shapes = {
+        network.get_input(i).name: list(network.get_input(i).shape)
+        for i in range(network.num_inputs)
+    }
+    if "features" in input_shapes:
+        shape = input_shapes["features"]
+        minimum = 100
+        if len(shape) != 2 or not minimum <= shape[0] <= 3500:
+            raise ValueError(f"Unsupported PTV3 features shape in {onnx_path}: {shape}")
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
@@ -89,15 +103,12 @@ def build_engine(
     config.avg_timing_iterations = timing_iterations
     config.max_aux_streams = 0
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
-    if precision == "fp16":
-        fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
-        if fp16_flag is not None:
-            config.set_flag(fp16_flag)
-    elif precision == "fp32":
-        config.clear_flag(trt.BuilderFlag.TF32)
-    else:
+    if precision not in ("fp16", "fp32"):
         raise ValueError(f"Unsupported precision: {precision}")
-
+    # Types are explicit in ONNX; precision-enabling flags are invalid with strong typing.
+    tf32 = getattr(trt.BuilderFlag, "TF32", None)
+    if precision == "fp32" and tf32 is not None:
+        config.clear_flag(tf32)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError(f"TensorRT failed to build {onnx_path}")
@@ -109,11 +120,15 @@ def build_engine(
         "precision": precision,
         "network_layers_before_build": network.num_layers,
         "serialized_bytes": plan_path.stat().st_size,
+        "input_shapes": input_shapes,
     }
 
 
 def main():
     args = parse_args()
+    plugin_handle = ctypes.CDLL(
+        str(args.plugin_library.resolve()), mode=ctypes.RTLD_GLOBAL
+    )
     if args.diffusion_grasps < 1:
         raise ValueError("--diffusion-grasps must be positive")
     if args.obb_grasps < 0:
@@ -129,12 +144,14 @@ def main():
         "builder_optimization_level": args.optimization_level,
         "engines": {},
     }
-    ptv3_graphs = [
-        path.stem for path in sorted((args.onnx_dir / "ptv3").glob("ptv3_*.onnx"))
-    ]
-    if not ptv3_graphs:
-        raise RuntimeError(f"No PTV3 ONNX graphs found under {args.onnx_dir / 'ptv3'}")
-    graphs = [*GRAPH_PRECISIONS, *ptv3_graphs]
+    encoder_graphs = ["ptv3_generator", "ptv3_discriminator"]
+    exported_capacities = read_stage_capacities(args.onnx_dir / "ptv3")
+    # Invalidate the previous cache marker before replacing any plan. A failed
+    # build must not leave an apparently complete profile for the installer.
+    (args.output_dir / PROFILE_FILENAME).write_text(
+        json.dumps({"stage_capacities": [], "status": "building"})
+    )
+    graphs = [*GRAPH_PRECISIONS, *encoder_graphs]
     for graph in graphs:
         if graph in GRAPH_PRECISIONS:
             precision = GRAPH_PRECISIONS[graph]
@@ -162,6 +179,24 @@ def main():
             TIMING_ITERATIONS,
             args.optimization_level,
         )
+    capacities = validate_stage_capacities(
+        report["engines"]["ptv3_generator"]["input_shapes"][
+            f"stage{i}_neighbor_indices_k3"
+        ][0]
+        for i in range(5)
+    )
+    discriminator_capacities = tuple(
+        report["engines"]["ptv3_discriminator"]["input_shapes"][
+            f"stage{i}_neighbor_indices_k3"
+        ][0]
+        for i in range(5)
+    )
+    if capacities != discriminator_capacities or (
+        exported_capacities is not None and capacities != exported_capacities
+    ):
+        raise ValueError("PTV3 generator/discriminator/export profile mismatch")
+    report["stage_capacities"] = capacities
+    write_stage_capacities(args.output_dir, capacities)
     report_path = args.output_dir / (
         f"build_report_d{args.diffusion_grasps}_o{args.obb_grasps}.json"
     )

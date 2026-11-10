@@ -33,10 +33,6 @@ constexpr int kPointCount = 3500;
 constexpr int kMinimumPointCount = 100;
 static_assert(Runtime::kEnginePointCount == kPointCount);
 static_assert(Runtime::kMinimumPointCount == kMinimumPointCount);
-constexpr std::array<int, kStageCount> kCapacities{kPointCount, 1536, 512, 128,
-                                                    64};
-constexpr std::array<int, kStageCount> kInputChannels{3, 64, 128, 256, 512};
-constexpr std::array<int, kStageCount> kOutputChannels{64, 128, 256, 512, 512};
 constexpr int kOrderCount = 4;
 constexpr std::array<int, kStageCount> kUsedOrderCounts{2, 2, 2, 4, 2};
 constexpr int kPatchMaximum = 1024;
@@ -153,10 +149,8 @@ struct TopologyStage {
 };
 
 struct EncoderBranch {
-  std::array<void*, kStageCount> inputs{};
-  std::array<void*, kStageCount> outputs{};
   void* embedding = nullptr;
-  std::array<std::unique_ptr<detail::TensorRtPlan>, kStageCount> plans;
+  std::unique_ptr<detail::TensorRtPlan> plan;
 };
 
 }  // namespace
@@ -166,6 +160,7 @@ class Runtime::Impl {
   explicit Impl(RuntimeConfig config)
       : config_(std::move(config)), domain_(detail::ExecutionDomain::Primary()) {
     ValidateConfig();
+    LoadPlans();
     root_stream_ = domain_.CreateStream();
     generator_stream_ = domain_.CreateStream();
     discriminator_stream_ = domain_.CreateStream();
@@ -187,7 +182,6 @@ class Runtime::Impl {
     CheckCublas(cublasCreate(&cublas_), "cublasCreate");
     AllocateBuffers();
     LoadConstants();
-    LoadPlans();
     BindPlans();
     SetGripperEmbeddings(nullptr, nullptr);
     CheckCuda(cudaMemset(grasp_volume_, 0, 6 * sizeof(float)),
@@ -400,6 +394,10 @@ class Runtime::Impl {
 
   int device() const noexcept { return domain_.device(); }
 
+  std::array<std::int64_t, 5> stage_capacities() const noexcept {
+    return capacities_;
+  }
+
   RuntimeProfile Profile(int warmup_iterations, int measured_iterations) {
     domain_.Activate();
     RequireGraspVolume();
@@ -583,13 +581,13 @@ class Runtime::Impl {
     center_ = Allocate<float>(3);
     input_features_ = Allocate<__half>(kPointCount * 3);
     maximum_coordinate_ = Allocate<std::int32_t>(1);
-    pool_segment_ids_ = Allocate<std::int64_t>(kCapacities[0]);
+    pool_segment_ids_ = Allocate<std::int64_t>(capacities_[0]);
     topology_valid_counts_ = Allocate<std::int64_t>(kStageCount);
     topology_overflow_ = Allocate<bool>(kStageCount - 1);
 
     for (int index = 0; index < kStageCount; ++index) {
       TopologyStage& stage = topology_[index];
-      stage.capacity = kCapacities[index];
+      stage.capacity = capacities_[index];
       stage.patch_size = PatchSize(stage.capacity);
       stage.padded_capacity = PaddedCapacity(stage.capacity);
       stage.coordinates = Allocate<float>(stage.capacity * 3);
@@ -611,15 +609,13 @@ class Runtime::Impl {
       stage.valid_key_counts =
           Allocate<std::int32_t>(stage.padded_capacity / stage.patch_size);
       if (index + 1 < kStageCount) {
-        stage.pool_index_ptr = Allocate<std::int64_t>(kCapacities[index + 1] + 1);
+        stage.pool_index_ptr = Allocate<std::int64_t>(capacities_[index + 1] + 1);
         stage.pool_cluster = Allocate<std::int64_t>(stage.capacity);
         stage.overflow = topology_overflow_ + index;
       }
     }
     offsets_k3_ = Allocate<std::int64_t>(27 * 3);
     offsets_k5_ = Allocate<std::int64_t>(125 * 3);
-    AllocateBranch(&generator_);
-    AllocateBranch(&discriminator_);
 
     observation_ = Allocate<__half>(1024);
     generator_.embedding = observation_;
@@ -666,18 +662,6 @@ class Runtime::Impl {
     denoising_coefficients_ = Allocate<__half>(denoising_steps() * 5 * 6);
   }
 
-  void AllocateBranch(EncoderBranch* branch) {
-    branch->inputs[0] = input_features_;
-    for (int stage = 0; stage < kStageCount; ++stage) {
-      branch->outputs[stage] = Allocate<__half>(
-          kCapacities[stage] * kOutputChannels[stage]);
-      if (stage + 1 < kStageCount) {
-        branch->inputs[stage + 1] = Allocate<__half>(
-            kCapacities[stage + 1] * kOutputChannels[stage]);
-      }
-    }
-  }
-
   void LoadConstants() {
     std::vector<std::int64_t> k3;
     std::vector<std::int64_t> k5;
@@ -697,7 +681,7 @@ class Runtime::Impl {
     CheckCuda(cudaMemcpy(offsets_k5_, k5.data(), k5.size() * sizeof(k5[0]),
                          cudaMemcpyHostToDevice),
               "copy K5 offsets");
-    const std::int64_t initial_valid_count = kCapacities[0];
+    const std::int64_t initial_valid_count = capacities_[0];
     CheckCuda(cudaMemcpy(topology_[0].valid_count, &initial_valid_count,
                          sizeof(initial_valid_count), cudaMemcpyHostToDevice),
               "copy initial valid count");
@@ -735,18 +719,41 @@ class Runtime::Impl {
 
   void LoadPlans() {
     const auto engines = config_.artifact_directory / "engines";
+    generator_.plan = std::make_unique<detail::TensorRtPlan>(engines / "ptv3/ptv3_generator_fp16.plan");
+    discriminator_.plan = std::make_unique<detail::TensorRtPlan>(engines / "ptv3/ptv3_discriminator_fp16.plan");
+    using Type = nvinfer1::DataType;
     for (int stage = 0; stage < kStageCount; ++stage) {
-      generator_.plans[stage] = std::make_unique<detail::TensorRtPlan>(
-          engines / "ptv3" /
-          ("ptv3_generator_stage" + std::to_string(stage) + "_fp16.plan"));
-      discriminator_.plans[stage] = std::make_unique<detail::TensorRtPlan>(
-          engines / "ptv3" /
-          ("ptv3_discriminator_stage" + std::to_string(stage) +
-           "_fp16.plan"));
-      tensorrt_device_memory_bytes_ +=
-          generator_.plans[stage]->device_memory_bytes();
-      tensorrt_device_memory_bytes_ +=
-          discriminator_.plans[stage]->device_memory_bytes();
+      const auto prefix = "stage" + std::to_string(stage) + "_";
+      const auto shape = generator_.plan->Shape((prefix + "neighbor_indices_k3").c_str());
+      const int minimum = stage == 0 ? kMinimumPointCount : 1;
+      if (shape.nbDims != 2 || shape.d[0] < minimum || shape.d[0] > kPointCount)
+        throw std::invalid_argument("PTV3 capacity outside supported range");
+      capacities_[stage] = shape.d[0];
+      auto capacity = capacities_[stage];
+      auto padded = PaddedCapacity(capacity);
+      auto patch = PatchSize(capacity);
+      for (auto* plan : {generator_.plan.get(), discriminator_.plan.get()}) {
+        plan->CheckTensor((prefix + "neighbor_indices_k3").c_str(), {capacity,27}, Type::kINT64);
+        plan->CheckTensor((prefix + "neighbor_mask_k3").c_str(), {capacity,27}, Type::kBOOL);
+        plan->CheckTensor((prefix + "attention_order").c_str(), {kOrderCount,padded}, Type::kINT64);
+        plan->CheckTensor((prefix + "attention_inverse").c_str(), {kOrderCount,capacity}, Type::kINT64);
+        plan->CheckTensor((prefix + "valid_key_counts").c_str(), {padded/patch}, Type::kINT32);
+        if (stage > 0) plan->CheckTensor((prefix + "valid_count").c_str(), {1}, Type::kINT64);
+        if (stage == 0) {
+          plan->CheckTensor((prefix + "neighbor_indices_k5").c_str(), {capacity,125}, Type::kINT64);
+          plan->CheckTensor((prefix + "neighbor_mask_k5").c_str(), {capacity,125}, Type::kBOOL);
+        }
+      }
+    }
+    for (auto* plan : {generator_.plan.get(), discriminator_.plan.get()}) {
+      plan->CheckTensor("features", {capacities_[0],3}, Type::kHALF);
+      plan->CheckTensor("embedding", {512}, Type::kHALF, true);
+      for (int stage=0; stage<4; ++stage) {
+        const auto prefix = "stage" + std::to_string(stage) + "_";
+        plan->CheckTensor((prefix + "pool_order").c_str(), {kOrderCount,capacities_[stage]}, Type::kINT64);
+        plan->CheckTensor((prefix + "pool_index_ptr").c_str(), {capacities_[stage+1]+1}, Type::kINT64);
+      }
+      tensorrt_device_memory_bytes_ += plan->device_memory_bytes();
     }
     denoiser_ = std::make_unique<detail::TensorRtPlan>(
         engines / ("denoiser_core_d" +
@@ -774,31 +781,38 @@ class Runtime::Impl {
   }
 
   void BindEncoder(EncoderBranch* branch) {
-    for (int stage = 0; stage < kStageCount; ++stage) {
-      TopologyStage& topology = topology_[stage];
-      auto& plan = branch->plans[stage];
-      plan->Bind("features", branch->inputs[stage]);
-      plan->Bind("neighbor_indices_k3", topology.neighbor_k3);
-      plan->Bind("neighbor_mask_k3", topology.neighbor_k3_mask);
-      plan->Bind("attention_order", topology.attention_order);
-      plan->Bind("attention_inverse", topology.attention_inverse);
-      plan->Bind("valid_key_counts", topology.valid_key_counts);
-      if (stage == 0) {
-        plan->Bind("neighbor_indices_k5", topology.neighbor_k5);
-        plan->Bind("neighbor_mask_k5", topology.neighbor_k5_mask);
+    auto& plan = branch->plan;
+    plan->Bind("features", input_features_);
+    plan->Bind("embedding", branch->embedding);
+    for (int stage=0; stage<kStageCount; ++stage) {
+      auto& t = topology_[stage];
+      auto prefix = "stage" + std::to_string(stage) + "_";
+      auto bind = [&](const char* name, void* pointer) { plan->Bind((prefix+name).c_str(), pointer); };
+      bind("neighbor_indices_k3", t.neighbor_k3);
+      bind("neighbor_mask_k3", t.neighbor_k3_mask);
+      bind("attention_order", t.attention_order);
+      bind("attention_inverse", t.attention_inverse);
+      bind("valid_key_counts", t.valid_key_counts);
+      if (stage>0) bind("valid_count", t.valid_count);
+      if (stage==0) {
+        bind("neighbor_indices_k5", t.neighbor_k5);
+        bind("neighbor_mask_k5", t.neighbor_k5_mask);
       }
-      plan->Bind("features_out", branch->outputs[stage]);
+      if (stage<4) {
+        bind("pool_order", t.order);
+        bind("pool_index_ptr", t.pool_index_ptr);
+      }
     }
   }
 
   void PreparePoints(cudaStream_t stream) {
     CheckCuda(LaunchFilterResampleDynamicFloat(
-                  input_points_, input_point_count_, kPointCount, kPointCount,
+                  input_points_, input_point_count_, kPointCount, capacities_[0],
                   kOutlierThreshold, filter_keep_, selected_indices_,
                   selected_count_, filtered_points_, stream),
               "filter and resample");
     CheckCuda(LaunchCenterScaleAndGridFloat(
-                  filtered_points_, kPointCount, kKappa, kGridSize,
+                  filtered_points_, capacities_[0], kKappa, kGridSize,
                   centered_points_, center_,
                   topology_[0].coordinates, input_features_,
                   topology_[0].grid_coordinates, maximum_coordinate_, stream),
@@ -807,7 +821,7 @@ class Runtime::Impl {
 
   void RunObbAndNoise(cudaStream_t stream) {
     CheckCuda(LaunchObbTopdownFloatDeviceDepth(
-                  centered_points_, kPointCount, obb_grasps_,
+                  centered_points_, capacities_[0], obb_grasps_,
                   obb_canonical_, obb_bounds_, gripper_depth_,
                   kKappa, config_.obb_grasps, stream),
               "OBB proposals");
@@ -903,22 +917,7 @@ class Runtime::Impl {
   }
 
   void RunEncoder(EncoderBranch* branch, cudaStream_t stream) {
-    for (int stage = 0; stage < kStageCount; ++stage) {
-      branch->plans[stage]->Enqueue(stream);
-      if (stage + 1 < kStageCount) {
-        CheckCuda(LaunchSegmentMaxFp16(
-                      branch->outputs[stage], topology_[stage].order,
-                      topology_[stage].pool_index_ptr,
-                      topology_[stage + 1].valid_count,
-                      branch->inputs[stage + 1], kCapacities[stage + 1],
-                      kOutputChannels[stage], stream),
-                  "PTV3 segment max");
-      }
-    }
-    CheckCuda(LaunchMeanFp16(branch->outputs[kStageCount - 1],
-                             topology_[kStageCount - 1].valid_count,
-                             branch->embedding, kEmbeddingChannels, stream),
-              "PTV3 final mean");
+    branch->plan->Enqueue(stream);
   }
 
   void ProjectObservation(cudaStream_t stream) {
@@ -1069,6 +1068,7 @@ class Runtime::Impl {
               "captured pipeline synchronize");
   }
 
+  std::array<std::int64_t, kStageCount> capacities_{};
   RuntimeConfig config_;
   detail::ExecutionDomain domain_;
   DeviceArena arena_;
@@ -1159,6 +1159,10 @@ class Runtime::Impl {
 Runtime::Runtime(RuntimeConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
 Runtime::~Runtime() = default;
+
+std::array<std::int64_t, 5> Runtime::stage_capacities() const noexcept {
+  return impl_->stage_capacities();
+}
 Runtime::Runtime(Runtime&&) noexcept = default;
 Runtime& Runtime::operator=(Runtime&&) noexcept = default;
 

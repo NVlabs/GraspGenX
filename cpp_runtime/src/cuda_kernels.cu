@@ -33,7 +33,7 @@ constexpr int kFixedAlgorithmItemsPerThread =
     kFixedAlgorithmCapacity / kThreads;
 
 // These fixed-size block collectives cover every deployment capacity
-// (3500, 1536, 512, 128, 64). All callers launch exactly kThreads threads.
+// up to 3500 per stage. All callers launch exactly kThreads threads.
 __global__ void center_scale_grid_kernel(
     const float* __restrict__ points,
     float* __restrict__ centered_points,
@@ -394,21 +394,6 @@ __device__ __forceinline__ void compact_resample_impl(
     output[output_index * 3 + 1] = points[input_index * 3 + 1];
     output[output_index * 3 + 2] = points[input_index * 3 + 2];
   }
-}
-
-template <typename scalar_t>
-__global__ void compact_resample_kernel(
-    const scalar_t* __restrict__ points,
-    const bool* __restrict__ keep,
-    int64_t* __restrict__ selected_indices,
-    int32_t* __restrict__ selected_count,
-    scalar_t* __restrict__ output,
-    int input_count,
-    int output_count) {
-  __shared__ FixedBlockScan::TempStorage scan_storage;
-  compact_resample_impl(
-      points, keep, selected_indices, selected_count, output, input_count,
-      output_count, scan_storage);
 }
 
 template <typename scalar_t>
@@ -879,76 +864,18 @@ __global__ void serialized_pool_segments_padded_kernel(
   }
 }
 
-template <typename scalar_t>
-__global__ void sparse_gather_kernel(
-    const scalar_t* __restrict__ feat,
-    const int64_t* __restrict__ found_indices,
-    const bool* __restrict__ found_mask,
-    scalar_t* __restrict__ gathered,
-    int64_t point_count,
-    int64_t offset_count,
-    int64_t channels) {
-  const int64_t element_count = point_count * offset_count * channels;
-  for (int64_t flat_index =
-           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       flat_index < element_count;
-       flat_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
-    const int64_t channel = flat_index % channels;
-    const int64_t neighbor_slot = flat_index / channels;
-    gathered[flat_index] = found_mask[neighbor_slot]
-        ? feat[found_indices[neighbor_slot] * channels + channel]
-        : scalar_t{0};
+__device__ __forceinline__ NativeHalf encode_denoise_sample(
+    const NativeHalf* sample, const NativeHalf* weight,
+    const NativeHalf* bias, int channel) {
+  float value = static_cast<float>(bias[channel]);
+#pragma unroll
+  for (int input = 0; input < kDenoiseSampleDim; ++input) {
+    value = fmaf(
+        static_cast<float>(sample[input]),
+        static_cast<float>(weight[channel * kDenoiseSampleDim + input]),
+        value);
   }
-}
-
-template <typename scalar_t, int BlockThreads>
-__global__ void layer_norm_residual_inplace_kernel(
-    scalar_t* __restrict__ value,
-    const scalar_t* __restrict__ residual,
-    const scalar_t* __restrict__ weight,
-    const scalar_t* __restrict__ bias,
-    int64_t rows,
-    int channels,
-    float epsilon) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
-  if (row >= rows) {
-    return;
-  }
-  static_assert(BlockThreads == kThreads);
-  using BlockReduce = cub::BlockReduce<float, BlockThreads>;
-  __shared__ typename BlockReduce::TempStorage reduction;
-  __shared__ float mean;
-  __shared__ float inverse_std;
-  float local_sum = 0.0F;
-  for (int channel = threadIdx.x; channel < channels; channel += BlockThreads) {
-    local_sum += static_cast<float>(value[row * channels + channel]);
-  }
-  const float sum = BlockReduce(reduction).Sum(local_sum);
-  if (threadIdx.x == 0) {
-    mean = sum / static_cast<float>(channels);
-  }
-  __syncthreads();
-  float local_squared = 0.0F;
-  for (int channel = threadIdx.x; channel < channels; channel += BlockThreads) {
-    const float centered =
-        static_cast<float>(value[row * channels + channel]) - mean;
-    local_squared = fmaf(centered, centered, local_squared);
-  }
-  const float squared_sum = BlockReduce(reduction).Sum(local_squared);
-  if (threadIdx.x == 0) {
-    inverse_std = rsqrtf(
-        squared_sum / static_cast<float>(channels) + epsilon);
-  }
-  __syncthreads();
-  for (int channel = threadIdx.x; channel < channels; channel += BlockThreads) {
-    const int64_t index = row * channels + channel;
-    const float normalized =
-        (static_cast<float>(value[index]) - mean) * inverse_std;
-    value[index] = static_cast<scalar_t>(
-        static_cast<float>(residual[index])
-        + normalized * static_cast<float>(weight[channel])
-        + static_cast<float>(bias[channel]));
-  }
+  return static_cast<NativeHalf>(fmaxf(value, 0.0F));
 }
 
 __global__ void denoise_sample_encode_kernel(
@@ -975,77 +902,15 @@ __global__ void denoise_sample_encode_kernel(
   }
   const int64_t row = output_index / kDenoiseHiddenDim;
   const int channel = output_index % kDenoiseHiddenDim;
-  float value = static_cast<float>(bias[channel]);
-#pragma unroll
-  for (int input = 0; input < kDenoiseSampleDim; ++input) {
-    value = fmaf(
-        static_cast<float>(sample[row * kDenoiseSampleDim + input]),
-        static_cast<float>(weight[channel * kDenoiseSampleDim + input]),
-        value);
-  }
-  sample_output[output_index] = static_cast<NativeHalf>(fmaxf(value, 0.0F));
+  sample_output[output_index] = encode_denoise_sample(
+      sample + row * kDenoiseSampleDim, weight, bias, channel);
 }
 
+// All DDPM transitions share the same prediction and update arithmetic. The
+// recurrent specialization also encodes the rounded FP16 state for the next
+// step; the final specialization omits that work at compile time.
+template <bool EncodeNext>
 __global__ void denoise_step_kernel(
-    const NativeHalf* __restrict__ prediction_hidden,
-    const NativeHalf* __restrict__ sample,
-    const NativeHalf* __restrict__ variance_noise,
-    const NativeHalf* __restrict__ weight,
-    const NativeHalf* __restrict__ bias,
-    const NativeHalf* __restrict__ coefficients,
-    NativeHalf* __restrict__ output,
-    int64_t rows) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
-  const int output_channel = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  if (row >= rows || output_channel >= kDenoiseSampleDim) {
-    return;
-  }
-  float prediction = 0.0F;
-#pragma unroll
-  for (int input = lane; input < kDenoiseHiddenDim; input += 32) {
-    prediction = fmaf(
-        static_cast<float>(
-            prediction_hidden[row * kDenoiseHiddenDim + input]),
-        static_cast<float>(
-            weight[output_channel * kDenoiseHiddenDim + input]),
-        prediction);
-  }
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    prediction += __shfl_down_sync(0xffffffffU, prediction, offset);
-  }
-  if (lane != 0) {
-    return;
-  }
-  prediction += static_cast<float>(bias[output_channel]);
-  const int64_t sample_index = row * kDenoiseSampleDim + output_channel;
-  const float current = static_cast<float>(sample[sample_index]);
-  const float predicted_original = fminf(
-      1.0F,
-      fmaxf(
-          -1.0F,
-          current * static_cast<float>(coefficients[output_channel])
-              + prediction
-                  * static_cast<float>(
-                      coefficients[kDenoiseSampleDim + output_channel])));
-  const float previous =
-      predicted_original
-          * static_cast<float>(
-              coefficients[2 * kDenoiseSampleDim + output_channel])
-      + current
-          * static_cast<float>(
-              coefficients[3 * kDenoiseSampleDim + output_channel])
-      + static_cast<float>(variance_noise[sample_index])
-          * static_cast<float>(
-              coefficients[4 * kDenoiseSampleDim + output_channel]);
-  output[sample_index] = static_cast<NativeHalf>(previous);
-}
-
-// Every recurrent boundary except the last consumes the six-value denoiser output
-// immediately in the next 6 -> 512 sample projection. Keeping the rounded
-// FP16 state in shared memory preserves the original arithmetic while removing
-// one launch and one global read from each transition between denoiser steps.
-__global__ void denoise_step_sample_encode_kernel(
     const NativeHalf* __restrict__ prediction_hidden,
     const NativeHalf* __restrict__ sample,
     const NativeHalf* __restrict__ variance_noise,
@@ -1104,35 +969,30 @@ __global__ void denoise_step_sample_encode_kernel(
                   coefficients[4 * kDenoiseSampleDim + warp]);
       const NativeHalf rounded = static_cast<NativeHalf>(previous);
       output[sample_index] = rounded;
-      rounded_sample[warp] = rounded;
+      if constexpr (EncodeNext) {
+        rounded_sample[warp] = rounded;
+      }
     }
   }
 
-  if (blockIdx.x == 0) {
-    const int64_t condition_elements = object_count * 2048;
-    for (int64_t index = threadIdx.x; index < condition_elements;
-         index += blockDim.x) {
-      conditioning_output[index] = static_cast<NativeHalf>(
-          static_cast<float>(observation_projection[index])
-          + static_cast<float>(timestep_conditioning[index % 2048]));
+  if constexpr (EncodeNext) {
+    if (blockIdx.x == 0) {
+      const int64_t condition_elements = object_count * 2048;
+      for (int64_t index = threadIdx.x; index < condition_elements;
+           index += blockDim.x) {
+        conditioning_output[index] = static_cast<NativeHalf>(
+            static_cast<float>(observation_projection[index])
+            + static_cast<float>(timestep_conditioning[index % 2048]));
+      }
+    }
+    __syncthreads();
+
+    const int channel = threadIdx.x;
+    if (row < rows && channel < kDenoiseHiddenDim) {
+      sample_output[row * kDenoiseHiddenDim + channel] = encode_denoise_sample(
+          rounded_sample, sample_weight, sample_bias, channel);
     }
   }
-  __syncthreads();
-
-  const int channel = threadIdx.x;
-  if (row >= rows || channel >= kDenoiseHiddenDim) {
-    return;
-  }
-  float value = static_cast<float>(sample_bias[channel]);
-#pragma unroll
-  for (int input = 0; input < kDenoiseSampleDim; ++input) {
-    value = fmaf(
-        static_cast<float>(rounded_sample[input]),
-        static_cast<float>(sample_weight[channel * kDenoiseSampleDim + input]),
-        value);
-  }
-  sample_output[row * kDenoiseHiddenDim + channel] =
-      static_cast<NativeHalf>(fmaxf(value, 0.0F));
 }
 
 template <typename scalar_t>
@@ -1210,48 +1070,12 @@ __device__ __forceinline__ void knn_l1_filter_impl(
 }
 
 template <typename scalar_t>
-__global__ void knn_l1_filter_kernel(
-    const scalar_t* __restrict__ points,
-    bool* __restrict__ keep,
-    int64_t point_count,
-    float threshold) {
-  knn_l1_filter_impl(points, keep, point_count, threshold);
-}
-
-template <typename scalar_t>
 __global__ void knn_l1_filter_dynamic_kernel(
     const scalar_t* __restrict__ points,
     bool* __restrict__ keep,
     const int64_t* __restrict__ point_count,
     float threshold) {
   knn_l1_filter_impl(points, keep, point_count[0], threshold);
-}
-
-template <typename scalar_t>
-__global__ void resample_filtered_points_kernel(
-    const scalar_t* __restrict__ points,
-    const int64_t* __restrict__ selected_indices,
-    const int32_t* __restrict__ selected_count,
-    scalar_t* __restrict__ output,
-    int64_t input_count,
-    int64_t output_count) {
-  const int64_t output_index =
-      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (output_index >= output_count) {
-    return;
-  }
-  const int64_t count = static_cast<int64_t>(selected_count[0]);
-  int64_t input_index;
-  if (count <= 0) {
-    input_index = output_index % input_count;
-  } else if (count >= output_count) {
-    input_index = selected_indices[(output_index * count) / output_count];
-  } else {
-    input_index = selected_indices[output_index % count];
-  }
-  output[output_index * 3 + 0] = points[input_index * 3 + 0];
-  output[output_index * 3 + 1] = points[input_index * 3 + 1];
-  output[output_index * 3 + 2] = points[input_index * 3 + 2];
 }
 
 template <typename scalar_t>
@@ -1524,19 +1348,6 @@ __device__ void write_obb_topdown_candidate(
   canonical_rt[grasp * 6 + 5] = 0.0F;
 }
 
-__global__ void obb_topdown_candidates_kernel(
-    const float* __restrict__ bounds,
-    float* __restrict__ matrices,
-    float* __restrict__ canonical_rt,
-    float gripper_depth,
-    float kappa,
-    int64_t grasp_count) {
-  const int64_t grasp =
-      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  write_obb_topdown_candidate(bounds, matrices, canonical_rt, gripper_depth,
-                              kappa, grasp_count, grasp);
-}
-
 __global__ void obb_topdown_candidates_device_depth_kernel(
     const float* __restrict__ bounds,
     float* __restrict__ matrices,
@@ -1558,7 +1369,7 @@ __global__ void segment_max_padded_kernel(
     const int64_t* __restrict__ segment_count,
     scalar_t* __restrict__ output,
     int64_t output_capacity,
-    int64_t channels) {
+    int64_t channels, int64_t input_capacity) {
   const int64_t flat =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t element_count = output_capacity * channels;
@@ -1571,16 +1382,19 @@ __global__ void segment_max_padded_kernel(
     output[flat] = static_cast<scalar_t>(0.0F);
     return;
   }
-  const int64_t begin = index_ptr[segment];
-  const int64_t end = index_ptr[segment + 1];
+  const int64_t begin = max(int64_t(0), min(index_ptr[segment], input_capacity));
+  const int64_t end = max(begin, min(index_ptr[segment + 1], input_capacity));
   float maximum = -3.402823466e+38F;
+  bool found = false;
   for (int64_t item = begin; item < end; ++item) {
-    const float value = static_cast<float>(
-        feat[indices[item] * channels + channel]);
+    const int64_t row = indices[item];
+    if (row < 0 || row >= input_capacity) continue;
+    found = true;
+    const float value = static_cast<float>(feat[row * channels + channel]);
     maximum = value > maximum ? value : maximum;
   }
   output[flat] = static_cast<scalar_t>(
-      begin < end ? maximum : 0.0F);
+      found ? maximum : 0.0F);
 }
 
 template <typename scalar_t>
@@ -1588,18 +1402,18 @@ __global__ void mean_padded_kernel(
     const scalar_t* __restrict__ feat,
     const int64_t* __restrict__ valid_count,
     scalar_t* __restrict__ output,
-    int64_t channels) {
+    int64_t channels, int64_t input_capacity) {
   const int64_t channel =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (channel >= channels) {
     return;
   }
-  const int64_t rows = valid_count[0];
+  const int64_t rows = max(int64_t(0), min(valid_count[0], input_capacity));
   float sum = 0.0F;
   for (int64_t row = 0; row < rows; ++row) {
     sum += static_cast<float>(feat[row * channels + channel]);
   }
-  output[channel] = static_cast<scalar_t>(sum / static_cast<float>(rows));
+  output[channel] = static_cast<scalar_t>(rows > 0 ? sum / static_cast<float>(rows) : 0.0F);
 }
 
 }  // namespace
@@ -1630,14 +1444,15 @@ cudaError_t LaunchDenoiseStepFp16(
     const void* variance_noise, const void* weight, const void* bias,
     const void* coefficients, void* output, int64_t rows,
     cudaStream_t stream) {
-  denoise_step_kernel<<<rows, 32 * kDenoiseSampleDim, 0, stream>>>(
+  denoise_step_kernel<false><<<rows, 32 * kDenoiseSampleDim, 0, stream>>>(
       static_cast<const NativeHalf*>(prediction_hidden),
       static_cast<const NativeHalf*>(sample),
       static_cast<const NativeHalf*>(variance_noise),
       static_cast<const NativeHalf*>(weight),
       static_cast<const NativeHalf*>(bias),
       static_cast<const NativeHalf*>(coefficients),
-      static_cast<NativeHalf*>(output), rows);
+      static_cast<NativeHalf*>(output), nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, rows, 0);
   return cudaPeekAtLastError();
 }
 
@@ -1649,7 +1464,7 @@ cudaError_t LaunchDenoiseStepAndSampleEncodeFp16(
     const void* observation_projection, const void* timestep_conditioning,
     void* sample_output, void* conditioning_output, int64_t rows,
     int64_t object_count, cudaStream_t stream) {
-  denoise_step_sample_encode_kernel<<<rows, kDenoiseHiddenDim, 0, stream>>>(
+  denoise_step_kernel<true><<<rows, kDenoiseHiddenDim, 0, stream>>>(
       static_cast<const NativeHalf*>(prediction_hidden),
       static_cast<const NativeHalf*>(sample),
       static_cast<const NativeHalf*>(variance_noise),
@@ -1676,22 +1491,6 @@ cudaError_t LaunchFinalizeSo3Fp16(
   return cudaPeekAtLastError();
 }
 
-cudaError_t LaunchObbTopdownFloat(
-    const float* points, int64_t point_count, float* matrices,
-    float* canonical_rt, float* bounds, float gripper_depth, float kappa,
-    int64_t grasp_count, cudaStream_t stream) {
-  obb_pca_orientation_kernel<<<1, kThreads, 0, stream>>>(
-      points, bounds, point_count);
-  robust_axis_bounds_kernel<<<3, kObbSortThreads, 0, stream>>>(
-      points, bounds, point_count);
-  if (grasp_count > 0) {
-    obb_topdown_candidates_kernel<<<
-        (grasp_count + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        bounds, matrices, canonical_rt, gripper_depth, kappa, grasp_count);
-  }
-  return cudaPeekAtLastError();
-}
-
 cudaError_t LaunchObbTopdownFloatDeviceDepth(
     const float* points, int64_t point_count, float* matrices,
     float* canonical_rt, float* bounds, const float* gripper_depth, float kappa,
@@ -1711,41 +1510,23 @@ cudaError_t LaunchObbTopdownFloatDeviceDepth(
 cudaError_t LaunchSegmentMaxFp16(
     const void* features, const int64_t* indices, const int64_t* index_ptr,
     const int64_t* segment_count, void* output, int64_t output_capacity,
-    int64_t channels, cudaStream_t stream) {
+    int64_t channels, int64_t input_capacity, cudaStream_t stream) {
   const int64_t elements = output_capacity * channels;
   segment_max_padded_kernel<NativeHalf><<<
       (elements + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       static_cast<const NativeHalf*>(features), indices, index_ptr,
       segment_count, static_cast<NativeHalf*>(output), output_capacity,
-      channels);
+      channels, input_capacity);
   return cudaPeekAtLastError();
 }
 
 cudaError_t LaunchMeanFp16(
     const void* features, const int64_t* valid_count, void* output,
-    int64_t channels, cudaStream_t stream) {
+    int64_t channels, int64_t input_capacity, cudaStream_t stream) {
   mean_padded_kernel<NativeHalf><<<
       (channels + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       static_cast<const NativeHalf*>(features), valid_count,
-      static_cast<NativeHalf*>(output), channels);
-  return cudaPeekAtLastError();
-}
-
-cudaError_t LaunchFilterResampleFloat(
-    const float* points, int64_t point_count, int64_t output_count,
-    float threshold, bool* keep, int64_t* selected_indices,
-    int32_t* selected_count, float* output, cudaStream_t stream) {
-  if (point_count <= 0 || point_count > kFixedAlgorithmCapacity
-      || output_count <= 0 || output_count > kFixedAlgorithmCapacity) {
-    return cudaErrorInvalidValue;
-  }
-  const int blocks = static_cast<int>(
-      (point_count + kFilterQueriesPerBlock - 1) / kFilterQueriesPerBlock);
-  knn_l1_filter_kernel<float><<<blocks, kFilterThreads, 0, stream>>>(
-      points, keep, point_count, threshold);
-  compact_resample_kernel<float><<<1, kThreads, 0, stream>>>(
-      points, keep, selected_indices, selected_count, output,
-      static_cast<int>(point_count), static_cast<int>(output_count));
+      static_cast<NativeHalf*>(output), channels, input_capacity);
   return cudaPeekAtLastError();
 }
 
@@ -1841,9 +1622,6 @@ cudaError_t LaunchSerializedPoolingPadded(
     int32_t accumulated_pooling_depth, cudaStream_t stream,
     cudaStream_t order_stream, cudaEvent_t pool_data_ready,
     cudaEvent_t order_ready) {
-  if (output_capacity > 6 * kThreads) {
-    return cudaErrorInvalidValue;
-  }
   if (input_capacity > kFixedAlgorithmCapacity
       || output_capacity > kFixedAlgorithmCapacity) {
     return cudaErrorInvalidValue;

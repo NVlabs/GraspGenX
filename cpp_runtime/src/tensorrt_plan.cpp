@@ -36,7 +36,7 @@ void Logger::log(Severity severity, const char* message) noexcept {
   }
 }
 
-TensorRtPlan::TensorRtPlan(const std::filesystem::path& path) {
+TensorRtPlan::TensorRtPlan(const std::filesystem::path& path) : path_(path) {
   const std::vector<char> bytes = ReadFile(path);
   runtime_.reset(nvinfer1::createInferRuntime(logger_));
   if (!runtime_) {
@@ -74,6 +74,31 @@ void TensorRtPlan::Enqueue(cudaStream_t stream) {
 
 std::size_t TensorRtPlan::device_memory_bytes() const noexcept {
   return engine_->getDeviceMemorySizeV2();
+}
+
+nvinfer1::Dims TensorRtPlan::Shape(const char* name) const {
+  const auto shape = engine_->getTensorShape(name);
+  if (shape.nbDims < 0)
+    throw std::invalid_argument(path_.string() + ": missing tensor " + name);
+  return shape;
+}
+
+void TensorRtPlan::CheckTensor(const char* name,
+                              std::initializer_list<std::int64_t> expected,
+                              nvinfer1::DataType type, bool output) const {
+  const auto shape = Shape(name);
+  bool matches = shape.nbDims == static_cast<int>(expected.size());
+  int index = 0;
+  for (auto dimension : expected) {
+    if (index >= shape.nbDims || shape.d[index] != dimension) matches = false;
+    ++index;
+  }
+  const auto mode = output ? nvinfer1::TensorIOMode::kOUTPUT
+                           : nvinfer1::TensorIOMode::kINPUT;
+  if (!matches || engine_->getTensorDataType(name) != type ||
+      engine_->getTensorIOMode(name) != mode)
+    throw std::invalid_argument(
+        path_.string() + ": incompatible shape, type, or mode for tensor " + name);
 }
 
 }  // namespace graspgenx::detail
