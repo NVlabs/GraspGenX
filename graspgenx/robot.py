@@ -19,7 +19,6 @@ import trimesh
 import trimesh.transformations as tra
 import yaml
 
-from graspgenx.dataset.eval_utils import load_urdf_scene
 
 
 @dataclass

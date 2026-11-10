@@ -1,6 +1,9 @@
 # End-to-End Demos
 
-This `README` gives examples of using GraspGenX in a end-to-end application, using a Motion Planner (curobo) and evaluated on a physics simulator (Newton). One can also use it to generate Synthetic Data Generation (SDG) for Vision-Language-Action (VLA) training. In these examples, the simulator and GraspGenX model uses the complete object mesh point cloud, but it can be extended to using using RGB-D observations from the simulator and using SAM segmentation.
+These demos combine GraspGenX grasp generation, cuRobo motion planning, and
+Newton/MuJoCo simulation. They use complete object meshes to sample the point
+clouds supplied to GraspGenX and export trajectories for visualization and
+Vision-Language-Action training data.
 
 **GraspGenX** predicts grasps on each object → **cuRobo** plans a
 collision-free arm trajectory to a collision-free grasp → **Newton/MuJoCo**
@@ -20,7 +23,6 @@ The pipeline needs a heavier sim/planning stack than the base GraspGenX
 inference install. It lives in an optional extra:
 
 ```bash
-uv sync                    # base GraspGenX (inference)
 uv sync --extra end2end    # + cuRobo, Newton
 python end2end/setup_end2end_deps.py   # cuRobo assets into ext/ + UR10e arx_x5 URDF
 ```
@@ -182,7 +184,7 @@ uv run pytest tests/test_end2end_demos.py -m end2end -v -s
 ```
 
 These are slow GPU integration tests. The UR10e case skips with a hint if the
-merged URDF hasn't been built yet — re-run `python end2end/setup_end2end_deps.py`
+merged URDF does not exist yet — re-run `python end2end/setup_end2end_deps.py`
 (it builds it).
 
 ---
@@ -211,16 +213,16 @@ then open `http://localhost:8090`.
 
 ## Physics notes (non-obvious tuning baked in)
 
-These choices in `dynamic_playback.py` fixed real artifacts — change with care:
+These choices in `dynamic_playback.py` prevent real artifacts — change with care:
 
 - **Bin collision = hollow primitives** (floor + 4 walls), not a solid cuboid.
   A solid `cuboid_from_extents` makes dropped objects rest on top of the block
   at the rim (~10 cm high) instead of falling in. (`GRASPGENX_BIN_COLLISION`
   env var = `primitives` (default) / `coacd` / `solid`.)
-- **Contact gap/margin left at Newton defaults** (not a tight 1 mm) — the tight
-  band caused resting-contact jitter that made tall objects shake and tip over.
-- **condim = 3** (MuJoCo default); the earlier `condim=4` torsional band-aid
-  was removed once the gap fix addressed the spin at its root.
+- **Contact gap/margin left at Newton defaults** (not a tight 1 mm) — a tight
+  band causes resting-contact jitter that makes tall objects shake and tip over.
+- **condim = 3** (MuJoCo default); the default contact gap addresses spin at its
+  root without a `condim=4` torsional band-aid.
 - **cuRobo is fed only collision-free grasps** (gripper-mesh vs scene), so it
   never plans to a geometrically colliding grasp.
 - **The PD target is initialized to the home pose** so the initial settle holds

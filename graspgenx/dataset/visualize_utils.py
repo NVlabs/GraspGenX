@@ -5,17 +5,7 @@ import numpy as np
 import torch
 import trimesh
 
-MAPPING_ID2NAME = {
-    0: "pos_true",
-    1: "neg_true",
-    2: "neg_hncolliding",
-    3: "neg_freespace",
-    4: "neg_hnretract",
-    5: "pos_true_onpolicy",
-    6: "neg_true_onpolicy",
-}
-
-MAPPING_NAME2ID = {val: key for key, val in MAPPING_ID2NAME.items()}
+from graspgenx.grasp_labels import MAPPING_NAME2ID
 
 
 def visualize_generator_dataset(

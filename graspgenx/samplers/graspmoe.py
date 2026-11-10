@@ -18,22 +18,25 @@ import numpy as np
 import torch
 from scipy.spatial import ConvexHull, cKDTree
 
-from graspgenx.dataset.dataset import collate
+from graspgenx.batching import collate
 from graspgenx.grasp_server import GraspGenXSampler
-from graspgenx.utils.point_cloud import point_cloud_outlier_removal
 from graspgenx.utils.logging_config import get_logger
+from graspgenx.utils.point_cloud import point_cloud_outlier_removal
 
 logger = get_logger(__name__)
+
+# Pure-PyTorch planner defaults. The C++ runtime owns its corresponding fixed
+# OBB shape and receives the requested count through the fast-runtime config.
+OBB_YAW_COUNT = 10
+OBB_Z_OFFSETS_CM = (-8.0, -6.0, -4.0, -2.0, 0.0)
 
 # GPU preprocessing flag. Controls (a) the OBB statistical-outlier-removal kNN
 # (torch.cdist instead of scipy cKDTree, double precision -> exact parity) and
 # (b) the diffusion-path point_cloud_outlier_removal device. Numerically
 # equivalent to the CPU paths.
 #
-# Default = CPU (scipy). It is enabled only when TensorRT is requested (the
-# GraspGenXSampler use_tensorrt path calls set_gpu_obb(True)); without TensorRT
-# the OBB stays on the CPU. The GRASPGENX_GPU_OBB env var is an explicit override
-# that wins over the automatic behaviour ("1" forces GPU, "0" forces CPU).
+# Default = CPU (scipy). GRASPGENX_GPU_OBB=1 explicitly enables the eager
+# PyTorch/CUDA implementation; the native runtime does not use this code.
 _GPU_OBB_ENV = os.environ.get("GRASPGENX_GPU_OBB")  # None | "0" | "1"
 _GPU_OBB = _GPU_OBB_ENV == "1"
 
@@ -46,17 +49,7 @@ _REUSE_OBJ_EMBED = True
 _VECTORIZE_CAND = True
 
 
-def set_gpu_obb(enabled: bool) -> None:
-    """Enable/disable GPU OBB (no-op if GRASPGENX_GPU_OBB explicitly set)."""
-    global _GPU_OBB
-    if _GPU_OBB_ENV is not None:
-        return  # explicit env override wins
-    _GPU_OBB = bool(enabled)
-
-
-def _sor_keep_mask_torch(
-    pts: np.ndarray, k: int, std_ratio: float
-) -> np.ndarray:
+def _sor_keep_mask_torch(pts: np.ndarray, k: int, std_ratio: float) -> np.ndarray:
     """kNN-based statistical-outlier-removal keep-mask, computed on GPU.
 
     Mirrors the scipy path exactly (double precision, mean of the k nearest
@@ -539,18 +532,69 @@ def _run_obb_branch(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+def _run_native_graspmoe(
+    object_pc: np.ndarray | torch.Tensor,
+    grasp_sampler: GraspGenXSampler,
+    grasp_threshold: float,
+    num_grasps: int,
+    topk_num_grasps: int,
+) -> dict:
+    """One-object fixed-shape C++ fast-inference path."""
+    diff, scores_diff, obb, scores_obb, bounds = grasp_sampler.sample_moe(
+        object_pc,
+        threshold=grasp_threshold,
+        num_grasps=num_grasps,
+        remove_outliers=True,
+    )
+    if topk_num_grasps is not None and topk_num_grasps > 0:
+        scores = torch.cat((scores_diff, scores_obb))
+        if len(scores) > topk_num_grasps:
+            _, order = torch.topk(scores, topk_num_grasps, largest=True, sorted=False)
+            diff_count = len(scores_diff)
+            diff_order = order[order < diff_count]
+            obb_order = order[order >= diff_count] - diff_count
+            diff = diff[diff_order]
+            scores_diff = scores_diff[diff_order]
+            obb = obb[obb_order]
+            scores_obb = scores_obb[obb_order]
+
+    grasps_diff = diff.cpu().numpy().astype(np.float32)
+    scores_diff_np = scores_diff.cpu().numpy().astype(np.float32)
+    grasps_obb = obb.cpu().numpy().astype(np.float32)
+    scores_obb_np = scores_obb.cpu().numpy().astype(np.float32)
+    obb_parameters = bounds.cpu().numpy().astype(np.float64)
+    cosine, sine = obb_parameters[6:]
+    obb_dict = {
+        "center": obb_parameters[:3],
+        "half_extent": obb_parameters[3:6],
+        "R": np.array(
+            [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        ),
+    }
+    return {
+        "grasps_diff": grasps_diff,
+        "scores_diff": scores_diff_np,
+        "grasps_obb": grasps_obb,
+        "scores_obb": scores_obb_np,
+        "pc_removed": np.zeros((0, 3), dtype=np.float32),
+        "obb": obb_dict,
+        "skipped_obb": False,
+    }
+
+
 def run_graspmoe(
     object_pc: np.ndarray,
     grasp_sampler: GraspGenXSampler,
     grasp_threshold: float = -1.0,
-    num_grasps: int = 200,
+    num_grasps: int | None = None,
     topk_num_grasps: int = -1,
-    num_yaws: int = 36,
+    num_yaws: int | None = None,
     z_offsets_cm: Sequence[float] = (-8, -6, -4, -2, 0),
     outlier_threshold: float = 0.014,
     outlier_k: int = 20,  # currently a no-op: graspgenx's point_cloud_outlier_removal hardcodes K=20
-    obb_mode: str = "advanced",
-    skip_obb_rule: str = "auto",
+    obb_mode: str = "pca",
+    skip_obb_rule: str = "never",
     obb_density: str = "sparse",
     obb_position_spacing_m: float = 0.01,
 ) -> dict:
@@ -565,7 +609,9 @@ def run_graspmoe(
         num_grasps: Diffusion samples to draw per pass.
         topk_num_grasps: Top-k cap applied to the union after both branches run.
                          -1 means "keep all".
-        num_yaws / z_offsets_cm: OBB sweep dimensions.
+        num_yaws / z_offsets_cm: OBB sweep dimensions. ``None`` selects the
+                                 configured count in the optimized runtime and
+                                 10 yaws in the eager implementation.
         outlier_threshold / outlier_k: outlier-removal hyperparameters (run once
                                        externally so both branches see the same cloud).
         obb_mode: "advanced" (SOR + hull + rotating calipers) or "pca".
@@ -578,6 +624,35 @@ def run_graspmoe(
             grasps_obb,  scores_obb,
             pc_removed,  obb (dict|None), skipped_obb.
     """
+    if num_grasps is None:
+        num_grasps = grasp_sampler.diffusion_grasps
+    native_obb_count = int(
+        getattr(getattr(grasp_sampler, "native_runtime", None), "obb_grasps", -1)
+    )
+    native_fixed_shape = (
+        grasp_sampler.using_fast_inference
+        and (num_yaws is None or int(num_yaws) * len(z_offsets_cm) == native_obb_count)
+        and tuple(float(value) for value in z_offsets_cm) == OBB_Z_OFFSETS_CM
+        and obb_mode == "pca"
+        and obb_density == "sparse"
+        and skip_obb_rule == "never"
+    )
+    if native_fixed_shape:
+        return _run_native_graspmoe(
+            object_pc,
+            grasp_sampler,
+            grasp_threshold,
+            num_grasps,
+            topk_num_grasps,
+        )
+    if grasp_sampler.using_fast_inference:
+        raise ValueError(
+            "the native C++ runtime supports its fixed PCA/sparse OBB plan only; "
+            "construct an eager sampler for custom OBB settings"
+        )
+    if num_yaws is None:
+        num_yaws = OBB_YAW_COUNT
+
     gripper = grasp_sampler.gripper
     gripper_depth_m = float(gripper.depth)
     # Use the sweep-volume X extent (= jaw opening width) for the skip-OBB
@@ -704,14 +779,14 @@ def run_graspmoe_batch(
     object_pcs: list,
     grasp_sampler: GraspGenXSampler,
     grasp_threshold: float = -1.0,
-    num_grasps: int = 200,
+    num_grasps: int | None = None,
     topk_num_grasps: int = -1,
-    num_yaws: int = 36,
+    num_yaws: int | None = None,
     z_offsets_cm: Sequence[float] = (-8, -6, -4, -2, 0),
     outlier_threshold: float = 0.014,
     outlier_k: int = 20,
-    obb_mode: str = "advanced",
-    skip_obb_rule: str = "auto",
+    obb_mode: str = "pca",
+    skip_obb_rule: str = "never",
     obb_density: str = "sparse",
     obb_position_spacing_m: float = 0.01,
 ) -> list:
@@ -723,6 +798,38 @@ def run_graspmoe_batch(
     n = len(object_pcs)
     if n == 0:
         return []
+    if num_grasps is None:
+        num_grasps = grasp_sampler.diffusion_grasps
+
+    native_obb_count = int(
+        getattr(getattr(grasp_sampler, "native_runtime", None), "obb_grasps", -1)
+    )
+    native_fixed_shape = (
+        grasp_sampler.using_fast_inference
+        and (num_yaws is None or int(num_yaws) * len(z_offsets_cm) == native_obb_count)
+        and tuple(float(value) for value in z_offsets_cm) == OBB_Z_OFFSETS_CM
+        and obb_mode == "pca"
+        and obb_density == "sparse"
+        and skip_obb_rule == "never"
+    )
+    if native_fixed_shape:
+        return [
+            _run_native_graspmoe(
+                point_cloud,
+                grasp_sampler,
+                grasp_threshold,
+                num_grasps,
+                topk_num_grasps,
+            )
+            for point_cloud in object_pcs
+        ]
+    if num_yaws is None:
+        num_yaws = OBB_YAW_COUNT
+    if grasp_sampler.using_fast_inference:
+        raise ValueError(
+            "the native C++ runtime supports its fixed PCA/sparse OBB plan only; "
+            "construct an eager sampler for custom OBB settings"
+        )
 
     gripper = grasp_sampler.gripper
     gripper_depth_m = float(gripper.depth)

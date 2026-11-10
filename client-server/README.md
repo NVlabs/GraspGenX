@@ -15,7 +15,7 @@ Unlike GraspGen (single gripper per server), GraspGenX loads a **single cross-em
 
 ## Three Modes of Use
 
-Beyond the legacy name-based `infer` action, the server exposes three
+Beyond the name-based `infer` action, the server exposes three
 **sweep-volume-params** modes — the gripper is described by 12 raw numbers per
 request, so the server needs no assets for it:
 
@@ -28,8 +28,8 @@ request, so the server needs no assets for it:
 Instance mask semantics (modes 2–3): the pixel/point value is the instance id;
 `0` means background/ignore. The server returns **all** generated grasps with
 scores; thresholding/top-k happen client-side. See
-[Example Scripts](#example-scripts-with-viser-visualization) for runnable,
-visualized versions of each mode.
+[Example Scripts](#example-scripts-with-viser-visualization) for a runnable
+visualized client, or [Python Client API](#python-client-api) for calls in each mode.
 
 ## Install
 
@@ -42,6 +42,19 @@ uv pip install pyzmq msgpack msgpack-numpy
 uv sync --extra serve
 ```
 
+For the native C++ runtime, install the build dependencies and build the
+DDPM20 plans and shared library on the server's GPU:
+
+```bash
+uv sync --extra serve --extra fast-inference
+uv run --quiet --extra serve --extra fast-inference graspgenx-install-fast-inference \
+    --diffusion-grasps 100 --obb-grasps 50
+```
+
+Start the server with `--fast-inference` and request matching candidate counts.
+The default PTV3 profile is `[3500,2048,1024,512,512]`; see the
+[native runtime guide](../cpp_runtime/README.md) for configuration and limits.
+
 The client-side machine only needs `pyzmq`, `msgpack`, `msgpack-numpy`, `numpy`, and `trimesh` — no PyTorch or CUDA.
 
 ## Start the server
@@ -50,7 +63,7 @@ The client-side machine only needs `pyzmq`, `msgpack`, `msgpack-numpy`, `numpy`,
 # Activate the GraspGenX uv venv first.
 python client-server/graspgenx_server.py \
     --config <repo>/ext/graspgenx_checkpoints/release \
-    --assets_dir <repo>/assets \
+    --assets_dir <repo>/ext/gripper_descriptions/assets \
     --default_gripper franka_panda \
     --port 5556
 ```
@@ -66,12 +79,14 @@ python client-server/graspgenx_server.py \
 python client-server/graspgenx_client.py \
     --mesh_file /path/to/box.obj --mesh_scale 1.0 \
     --gripper_name franka_panda \
+    --num_grasps 100 \
     --host localhost --port 5556
 
 # Or from a point cloud file (.pcd / .ply / .xyz / .npy):
 python client-server/graspgenx_client.py \
-    --pcd_file assets/sample_data/object_mesh/banana.obj \
+    --pcd_file /path/to/object.npy \
     --gripper_name robotiq_2f_140 \
+    --num_grasps 100 \
     --host localhost --port 5556
 
 # Params-only mode 1 (no gripper assets on the server) — pass raw
@@ -79,6 +94,7 @@ python client-server/graspgenx_client.py \
 python client-server/graspgenx_client.py \
     --mesh_file /path/to/box.obj \
     --sweep_volume_json /path/to/sweep_params.json \
+    --num_grasps 100 \
     --host localhost --port 5556
 
 # Add --visualize to render the result in a viser web viewer at :8080.
@@ -99,7 +115,7 @@ with GraspGenXClient(host="localhost", port=5556) as client:
     #     "generator_backbone": "ptv3vanilla",
     #     "discriminator_backbone": "ptv3vanilla",
     #     "grasp_repr": "r3_so3",
-    #     "num_diffusion_iters_eval": 20,
+    #     "num_diffusion_iters_eval": ...,  # checkpoint configuration
     #   },
     #   "assets_dir": "/.../graspgenx/assets",
     # }
@@ -108,7 +124,7 @@ with GraspGenXClient(host="localhost", port=5556) as client:
     grasps, confidences = client.infer(
         point_cloud,                  # (N, 3) numpy float32
         gripper_name="franka_panda",  # gripper whose sweep volume v2 conditions the model
-        num_grasps=200,               # diffusion samples
+        num_grasps=100,               # diffusion samples
         grasp_threshold=-1.0,         # -1.0 ⇒ use top-k instead of threshold
         topk_num_grasps=100,          # return top-k by confidence
     )
@@ -126,7 +142,7 @@ axis-aligned boxes in the gripper base frame (+Z = approach, +X = closing
 direction) enclosing the inner finger volume at the open and half-open
 states. Three actions accept those 12 numbers directly instead of a gripper
 name, so the server needs **no assets** for the gripper — including grippers
-it has never seen:
+outside its training set:
 
 ```python
 from graspgenx.serving import GraspGenXClient, SweepVolumeParams
@@ -172,7 +188,7 @@ with GraspGenXClient(host="localhost", port=5556) as client:
 
 Notes:
 
-- These actions are **params-only** — pass `gripper_name` to the legacy
+- These actions are **params-only** — pass `gripper_name` to the
   `infer` action instead if you want name-based lookup.
 - `planner="graspmoe"` (default) unions diffusion samples with OBB-swept
   candidates, all scored by the discriminator; per-grasp provenance is
@@ -180,10 +196,13 @@ Notes:
 - **The server returns every generated grasp with its score.** The
   `grasp_threshold` / `topk_num_grasps` arguments of the Python client are
   applied **client-side**; raw-wire callers must threshold themselves (the
-  server rejects those fields on the new actions).
-- The server runs eager PyTorch **fp32** by default. TensorRT is opt-in via
-  `graspgenx_server.py --tensorrt [--tensorrt_precision fp16]`; the
-  `metadata` response reports the active precision under `"precision"`.
+  server rejects those fields on these actions).
+- The server runs eager PyTorch **fp32** by default. The native C++ runtime is
+  enabled with `graspgenx_server.py --fast-inference`; it runs
+  the default released 20-step DDPM trajectory as one CUDA Graph and
+  uses four TensorRT plans for both complete PTV3 encoders, denoising, and scoring.
+  PointNet2 and Torch-TensorRT are not required.
+  The `metadata` response reports the active precision under `"precision"`.
 - Instances with fewer than `min_object_points` (default 100) valid points,
   or with no grasps found, are absent from the returned dict.
 - Collision filtering against the rest of the scene is **not** applied
@@ -191,39 +210,32 @@ Notes:
 
 ## Example Scripts (with viser visualization)
 
-`scripts/client_server_example_{1,2,3}.py` run one mode each against a live
-server on the shipped sample scenes and render the results in a
-[viser](https://viser.studio/) web viewer (grasps colored red→green by score,
-grouped per object under `obj/<label>/grasps/{diff,obb}_*` in the scene tree).
+`client-server/graspgenx_client.py` runs single-object inference against a live
+server and renders the results in a
+[viser](https://viser.studio/) web viewer (grasps colored red→green by score).
+Use the [Python Client API](#sweep-volume-params-api-no-gripper-assets-needed)
+for scene depth and scene point-cloud requests.
 
 ```bash
-# Terminal 1 — start the server once (fp32, no TensorRT by default):
-uv run python client-server/graspgenx_server.py \
-    --config ext/graspgenx_checkpoints/release --assets_dir assets --port 5556
+# Terminal 1 — start the server with the native C++ fast runtime:
+uv run --extra serve --extra fast-inference python client-server/graspgenx_server.py \
+    --config ext/graspgenx_checkpoints/release \
+    --assets_dir ext/gripper_descriptions/assets --port 5556 \
+    --fast-inference
 
-# Terminal 2 — run a mode, then open the URL the script prints:
-
-# Mode 1 (example 3) — single segmented object point cloud:
-uv run python scripts/client_server_example_3.py --gripper_name robotiq_2f_85 --port 5556
-
-# Mode 2 (example 1) — scene depth image + intrinsics + instance mask:
-uv run python scripts/client_server_example_1.py --gripper_name robotiq_2f_85 --port 5556
-
-# Mode 3 (example 2) — scene point cloud + instance mask:
-uv run python scripts/client_server_example_2.py --gripper_name robotiq_2f_85 --port 5556
+# Terminal 2 — run the client, then open the URL it prints:
+uv run --extra serve --extra visualization python client-server/graspgenx_client.py \
+    --mesh_file assets/sample_data/object_mesh/banana.obj \
+    --gripper_name robotiq_2f_85 --num_grasps 100 --port 5556 --visualize
 ```
 
-`--gripper_name` is resolved to sweep-volume params **locally** (only the 12
-numbers travel over the wire); pass `--sweep_volume_json file.json` instead
-for a gripper with no local assets. Common flags:
+`--gripper_name` selects a gripper from the server's assets; pass
+`--sweep_volume_json file.json` instead for a gripper described by raw params.
+Common flags:
 
-- `--scene_dir assets/sample_data/real_world/01` — the other shipped scene.
-- `--grasp_threshold 0.7` (default, client-side; `-1.0` disables) and
-  `--topk_num_grasps 100` (default; `-1` keeps everything the server sent).
-- `--planner diffusion` (default `graspmoe`) and
-  `--moe_obb_density dense-topandside` for a denser OBB sweep.
-- Example 3 only: `--object_index N` picks the object;
-  `--pcd_npy cloud.npy` sends your own (N,3) point cloud.
+- `--grasp_threshold 0.7` (client-side; `-1.0` disables) and
+  `--topk_num_grasps 100` (`-1` keeps everything the server sent).
+- `--pcd_file cloud.npy` sends your own (N,3) point cloud instead of a mesh.
 
 ## Supported Grippers
 
@@ -241,7 +253,7 @@ Wire format: **msgpack** (with `msgpack_numpy.patch()` so numpy arrays travel na
 |---------|--------|----------|
 | `{"action": "health"}` | — | `{"status": "ok"}` |
 | `{"action": "metadata"}` | — | `{"default_gripper": str?, "loaded_grippers": [str], "model": {...}, "assets_dir": str}` |
-| `{"action": "infer", ...}` | `point_cloud` (N,3 float32), `gripper_name` (str, optional if server has a default), `num_grasps` (int=200), `grasp_threshold` (float=-1.0), `topk_num_grasps` (int=100) | `{"grasps": (K,4,4) float32, "confidences": (K,) float32, "gripper_name": str, "timing": {"infer_ms": float}}` |
+| `{"action": "infer", ...}` | `point_cloud` (N,3 float32), `gripper_name` (str, optional if server has a default), `num_grasps` (int=100), `grasp_threshold` (float=-1.0), `topk_num_grasps` (int=100) | `{"grasps": (K,4,4) float32, "confidences": (K,) float32, "gripper_name": str, "timing": {"infer_ms": float}}` |
 | `{"action": "infer_object", ...}` | `point_cloud` (N,3 float32), `sweep_volume_params` (map or flat (12,) float32 — required, no gripper_name), `planner` ("graspmoe"\|"diffusion"), `num_grasps`, `moe_*` knobs | `{"grasps": (K,4,4), "confidences": (K,), "branch_tags": ["diff"\|"obb", ...], "timing": {...}}` — frame of the input PC; **ALL** generated grasps (`grasp_threshold`/`topk_num_grasps` are rejected — threshold client-side) |
 | `{"action": "infer_scene_depth", ...}` | `depth` (H,W float32 **meters**), `intrinsics` (3,3), `instance_mask` (H,W int, 0 = ignore), `sweep_volume_params`, `min_object_points` (int=100), planner + sampling knobs | `{"instance_ids": (M,) int32, "grasps": [(Ki,4,4)], "confidences": [(Ki,)], "branch_tags": [[str]], "skipped_instance_ids": (S,) int32, "timing": {...}}` — **camera frame**; parallel lists, aligned with `instance_ids` |
 | `{"action": "infer_scene_pc", ...}` | `point_cloud` ((N,3) or (H,W,3) float32), `instance_mask` (int array with N elements), `sweep_volume_params`, `min_object_points`, planner + sampling knobs | same shape as `infer_scene_depth`, grasps in the input PC's frame |

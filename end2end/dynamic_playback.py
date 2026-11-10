@@ -8,7 +8,7 @@ Given a cuRobo-planned joint trajectory plus the SceneBundle returned by
      and the manipulation target as a free rigid body sitting at its
      scene-builder pose.
   2. Steps a :class:`newton.solvers.SolverMuJoCo` solver under PD position
-     control, feeding the planned joint trajectory into ``joint_target_pos``
+     control, feeding the planned joint trajectory into ``joint_target_q``
      waypoint-by-waypoint. The Robotiq ``finger_joint`` close (already
      appended to the trajectory by the demo) drives the URDF's mimic
      constraints, so all six finger DOFs close together.
@@ -43,7 +43,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import trimesh
@@ -116,9 +116,9 @@ class _RobotLayout:
     """Bookkeeping for how Newton laid out the URDF after add_urdf.
 
     Indices reference ``builder.joint_label`` order. ``q_start`` values
-    are per-DOF offsets into ``model.joint_q`` / ``control.joint_target_pos``;
+    are per-DOF offsets into ``model.joint_q`` / ``control.joint_target_q``;
     ``qd_start`` values are per-DOF offsets into ``model.joint_qd`` /
-    ``control.joint_target_vel`` (same as q_start for single-DOF joints,
+    ``control.joint_target_qd`` (same as q_start for single-DOF joints,
     which is everything we have).
     """
 
@@ -138,6 +138,9 @@ class _RobotLayout:
     # accesses via :attr:`object_body_idx`). Clutter scenes have one
     # entry per object.
     object_body_idxs: List[int] = field(default_factory=list)
+    # Per-object free-joint coordinate offsets into ``model.joint_q``.
+    # Each object occupies seven values: xyz followed by quaternion xyzw.
+    object_q_starts: List[int] = field(default_factory=list)
     # Velocity-mode close: for each gripper joint, a (qd_offset,
     # closing_velocity) tuple. Empty for position-mode profiles.
     velocity_close_drives: List[Tuple[int, float]] = field(default_factory=list)
@@ -426,7 +429,7 @@ def _build_scene(
         xform=robot_base_xform,
         enable_self_collisions=False,
         parse_visuals_as_colliders=False,
-        collapse_fixed_joints=True,
+        collapse_fixed_joints=profile.collapse_fixed_joints,
     )
     urdf_shape_end = builder.shape_count  # last URDF shape index + 1
     # Per-shape MuJoCo geom overrides (condim, priority, mu, mu_torsional,
@@ -488,7 +491,10 @@ def _build_scene(
         bi = builder.shape_body[si]
         lbl = _bare(str(builder.body_label[bi])) if bi >= 0 else ""
         is_gripper = any(k in lbl for k in profile.gripper_body_keywords)
-        if is_gripper:
+        is_collider = bool(
+            builder.shape_flags[si] & newton.ShapeFlags.COLLIDE_SHAPES
+        )
+        if is_collider and is_gripper and profile.use_coacd_for_gripper:
             if not keywords or any(k in lbl for k in keywords):
                 coacd_mesh_indices.append(si)
             else:
@@ -641,7 +647,7 @@ def _build_scene(
     velocity_close_drives: List[Tuple[int, float]] = []
     if profile.gripper_control_mode == "velocity":
         # NewtonDataGen-style parallel jaw: ke=0, high kd, velocity mode.
-        # Closing happens by setting joint_target_vel to a constant
+        # Closing happens by setting joint_target_qd to a constant
         # closing rate during the close phase; contact equilibrium stops
         # the motion. Match `newton_grasp_eval.py`'s `FINGER_KD=800`.
         velocity_kd = float(profile.dynamic_overrides.get("finger_velocity_kd", 800.0))
@@ -834,12 +840,14 @@ def _build_scene(
         )
 
     log.info("  object_world_T = %s (initial)", bundle.object_world_T[:3, 3].tolist())
-    # Always add a ground plane so the object doesn't fall through the floor
-    # if a bin/table cuboid doesn't cover the world origin.
-    try:
-        builder.add_ground_plane()
-    except Exception as e:
-        log.warning("add_ground_plane failed: %s", e)
+    # Most legacy scenes rely on this safety plane. Exact collision-world
+    # reproductions can disable it (for example collision_test.yml has a
+    # tabletop below z=0, where an extra z=0 plane would intersect objects).
+    if bool(profile.dynamic_overrides.get("add_ground_plane", True)):
+        try:
+            builder.add_ground_plane()
+        except Exception as e:
+            log.warning("add_ground_plane failed: %s", e)
 
     # ---- 5. Manipulation target(s) as free rigid bodies -------------------
     # Multi-object scenes have N>1 entries in `bundle.objects`; single-object
@@ -847,6 +855,7 @@ def _build_scene(
     # mesh shape so finger / object contacts work the same as in the
     # single-object path.
     object_body_idxs: List[int] = []
+    object_q_starts: List[int] = []
     import os as _os
 
     object_shape_cfg = _shape_cfg(object_mu)
@@ -866,6 +875,7 @@ def _build_scene(
         # drifts and rotates slowly under gravity even with high mu.
         obj_joint_idx = builder.joint_count - 1
         if obj_joint_idx >= 0:
+            object_q_starts.append(int(builder.joint_q_start[obj_joint_idx]))
             obj_qd_start = builder.joint_qd_start[obj_joint_idx]
             for q_off in range(obj_qd_start, len(builder.joint_armature)):
                 builder.joint_armature[q_off] = obj_armature
@@ -946,9 +956,12 @@ def _build_scene(
                 )
             builder.body_mass[body_idx] = m_target
             builder.body_inv_mass[body_idx] = 1.0 / m_target
-            builder.body_inertia[body_idx] = I
-            builder.body_inv_inertia[body_idx] = np.linalg.inv(I)
-            builder.body_com[body_idx] = com
+            I_inv = np.linalg.inv(I)
+            builder.body_inertia[body_idx] = wp.mat33(*I.reshape(-1).tolist())
+            builder.body_inv_inertia[body_idx] = wp.mat33(
+                *I_inv.reshape(-1).tolist()
+            )
+            builder.body_com[body_idx] = wp.vec3(*com.tolist())
             log.info(
                 "%s deterministic mass=%.3f kg, inertia diag=%s",
                 obj.asset_id,
@@ -997,6 +1010,7 @@ def _build_scene(
         gripper_drives=gripper_drives,
         mimic_drives=mimic_drives,
         object_body_idxs=object_body_idxs,
+        object_q_starts=object_q_starts,
         velocity_close_drives=velocity_close_drives,
     )
     return model, layout, body_labels
@@ -1008,7 +1022,7 @@ def _set_joint_targets(
     arm_q: np.ndarray,
     gripper_q: Dict[str, float],
 ) -> np.ndarray:
-    """Build the per-DOF ``joint_target_pos`` array for one waypoint.
+    """Build the per-DOF ``joint_target_q`` array for one waypoint.
 
     Args:
         arm_q: array of length ``len(layout.arm_q_starts)`` with arm joint
@@ -1334,16 +1348,16 @@ def simulate_and_export(
             gripper_q[name] = (
                 float(joint_traj[wp_idx, col]) if col < n_traj_dof else open_v
             )
-        targets_np = control.joint_target_pos.numpy()
+        targets_np = control.joint_target_q.numpy()
         targets_np = _set_joint_targets(targets_np, layout, arm_q, gripper_q)
-        control.joint_target_pos.assign(targets_np)
+        control.joint_target_q.assign(targets_np)
 
         # Velocity-mode close (parallel-jaw style): instead of ramping
-        # position, set joint_target_vel directly. The trajectory tells
+        # position, set joint_target_qd directly. The trajectory tells
         # us *which* phase we're in (open / closing / closed) by
         # comparing the current gripper target to the open value.
         if layout.velocity_close_drives:
-            vel_targets = control.joint_target_vel.numpy()
+            vel_targets = control.joint_target_qd.numpy()
             for k, (q_off, close_vel) in enumerate(layout.velocity_close_drives):
                 name, _, open_v, close_v = layout.gripper_drives[k]
                 target = gripper_q[name]
@@ -1352,7 +1366,7 @@ def simulate_and_export(
                 # target == open_v so target_vel = 0 (no closing pressure).
                 is_open = abs(target - open_v) < 1e-6
                 vel_targets[q_off] = 0.0 if is_open else close_vel
-            control.joint_target_vel.assign(vel_targets)
+            control.joint_target_qd.assign(vel_targets)
 
         for s in range(sim_substeps):
             states[0].clear_forces()
@@ -1382,7 +1396,7 @@ def simulate_and_export(
 
         # --- Tracking-error accumulator (per arm joint) ---
         joint_q_now = states[0].joint_q.numpy()
-        tgt_q_now = control.joint_target_pos.numpy()
+        tgt_q_now = control.joint_target_q.numpy()
         arm_measured = joint_q_now[arm_q_offsets_np]
         arm_target = tgt_q_now[arm_q_offsets_np]
         arm_err = np.abs(arm_target - arm_measured)
@@ -1609,7 +1623,7 @@ class DynamicSession:
         self.control = self.model.control()
         # Initialize the PD target to the START config (home arm + open
         # gripper) so the initial settle HOLDS the home pose. Without this,
-        # control.joint_target_pos defaults to ~zero and the PD drags the
+        # control.joint_target_q defaults to ~zero and the PD drags the
         # arm off home during settle, which then shows up as a visible
         # "jump" when the first planned segment begins from the (correct)
         # home pose. Mirrors the per-frame target set in drive_segments.
@@ -1624,10 +1638,19 @@ class DynamicSession:
             name: open_v
             for name, _q_off, open_v, _close_v in self.layout.gripper_drives
         }
-        init_tgt = self.control.joint_target_pos.numpy()
+        init_tgt = self.control.joint_target_q.numpy()
         init_tgt = _set_joint_targets(init_tgt, self.layout, init_arm, init_grip)
-        self.control.joint_target_pos.assign(init_tgt)
+        self.control.joint_target_q.assign(init_tgt)
         self.step_dt = self.effective_dt
+
+        # The model defaults now contain the caller's requested home arm,
+        # open gripper, and the initial free-object poses. Keep explicit
+        # copies so repeated trials can reset without rebuilding Newton or
+        # carrying MuJoCo warm-start state across episodes.
+        self._reset_joint_q = self.model.joint_q.numpy().copy()
+        self._reset_joint_qd = self.model.joint_qd.numpy().copy()
+        self._reset_arm_q = init_arm.copy()
+        self._reset_gripper_q = init_grip.copy()
 
         # URDF FK for per-frame visual mesh transforms.
         self.fk = URDFFK(bundle.robot_urdf_path, asset_root=bundle.robot_asset_root)
@@ -1656,6 +1679,7 @@ class DynamicSession:
             self._arm_q_offsets.shape[0], dtype=np.float64
         )
         self._track_err_n = 0
+        self._sim_frame_count = 0
 
     # -- accessors ---------------------------------------------------------
     @property
@@ -1682,19 +1706,103 @@ class DynamicSession:
         body_q_np = self.states[0].body_q.numpy()
         return _wp_transform_to_matrix(body_q_np[self.layout.object_body_idxs[obj_idx]])
 
+    def reset(
+        self,
+        *,
+        clear_frames: bool = True,
+        object_world_poses: List[np.ndarray] | None = None,
+    ) -> None:
+        """Restore the robot and all free objects to their initial state.
+
+        This also clears MuJoCo's persistent solver buffers, controller
+        targets, NaN state, and tracking statistics. The expensive model,
+        collision decomposition, and solver construction are retained.
+
+        Args:
+            clear_frames: Clear accumulated export frames.
+            object_world_poses: Optional replacement 4x4 world poses, one per
+                free object. These update both Newton's reset coordinates and
+                the scene-bundle metadata without rebuilding the model.
+        """
+        reset_joint_q = self._reset_joint_q
+        if object_world_poses is not None:
+            if len(object_world_poses) != len(self.layout.object_q_starts):
+                raise ValueError(
+                    "object_world_poses must contain one pose per free object: "
+                    f"got {len(object_world_poses)}, expected "
+                    f"{len(self.layout.object_q_starts)}"
+                )
+            reset_joint_q = self._reset_joint_q.copy()
+            for index, (q_start, world_pose) in enumerate(
+                zip(self.layout.object_q_starts, object_world_poses)
+            ):
+                pose = np.asarray(world_pose, dtype=np.float64)
+                if pose.shape != (4, 4) or not np.isfinite(pose).all():
+                    raise ValueError(
+                        f"Object pose {index} must be a finite 4x4 transform"
+                    )
+                quat_wxyz = tra.quaternion_from_matrix(pose)
+                reset_joint_q[q_start : q_start + 7] = [
+                    float(pose[0, 3]),
+                    float(pose[1, 3]),
+                    float(pose[2, 3]),
+                    float(quat_wxyz[1]),
+                    float(quat_wxyz[2]),
+                    float(quat_wxyz[3]),
+                    float(quat_wxyz[0]),
+                ]
+                self.bundle.objects[index].world_T = pose.copy()
+            if object_world_poses:
+                self.bundle.object_world_T = np.asarray(
+                    object_world_poses[0], dtype=np.float64
+                ).copy()
+
+        for state in self.states:
+            state.joint_q.assign(reset_joint_q)
+            state.joint_qd.assign(self._reset_joint_qd)
+            state.clear_forces()
+            newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+
+        # flags=0 preserves the explicit state assigned above while clearing
+        # qacc warm-start, applied forces, activations, and controller buffers.
+        self.solver.reset(self.states[0], flags=0)
+
+        targets = self.control.joint_target_q.numpy()
+        targets = _set_joint_targets(
+            targets,
+            self.layout,
+            self._reset_arm_q,
+            self._reset_gripper_q,
+        )
+        self.control.joint_target_q.assign(targets)
+        self.control.joint_target_qd.zero_()
+
+        if clear_frames:
+            self.frames.clear()
+        self._nan_seen = False
+        self._track_err_peak.fill(0.0)
+        self._track_err_sq_sum.fill(0.0)
+        self._track_err_n = 0
+        self._sim_frame_count = 0
+
     # -- driving ----------------------------------------------------------
     def drive_segments(
         self,
         joint_traj: np.ndarray,
         phase_labels: List[Tuple[str, int]] | None = None,
         settle_frames: int = 0,
+        *,
+        record_frames: bool = True,
+        frame_callback: Callable[["DynamicSession", str], None] | None = None,
     ) -> bool:
         """Step the sim through ``joint_traj`` (T, n_arm+n_gripper).
 
         Optionally appends ``settle_frames`` extra frames after the
-        trajectory holding the final target. Each frame is recorded into
-        ``self.frames``. Returns False if a NaN was detected (caller
-        should stop driving further segments).
+        trajectory holding the final target. ``record_frames=False`` avoids
+        accumulating export data for long-running validation loops. A
+        ``frame_callback`` can update a live visualizer after every simulated
+        frame. Returns False if a NaN was detected (caller should stop driving
+        further segments).
 
         ``phase_labels`` is a list of ``(name, n_frames)`` mirroring
         :class:`TaskResult.segments`; if provided, each recorded frame's
@@ -1738,14 +1846,14 @@ class DynamicSession:
                     gripper_q[name] = (
                         float(joint_traj[wp_idx, col]) if col < n_traj_dof else open_v
                     )
-                targets_np = self.control.joint_target_pos.numpy()
+                targets_np = self.control.joint_target_q.numpy()
                 targets_np = _set_joint_targets(
                     targets_np, self.layout, arm_q, gripper_q
                 )
-                self.control.joint_target_pos.assign(targets_np)
+                self.control.joint_target_q.assign(targets_np)
 
                 if self.layout.velocity_close_drives:
-                    vel_targets = self.control.joint_target_vel.numpy()
+                    vel_targets = self.control.joint_target_qd.numpy()
                     for k, (q_off, close_vel) in enumerate(
                         self.layout.velocity_close_drives
                     ):
@@ -1753,7 +1861,7 @@ class DynamicSession:
                         target = gripper_q[name]
                         is_open = abs(target - open_v) < 1e-6
                         vel_targets[q_off] = 0.0 if is_open else close_vel
-                    self.control.joint_target_vel.assign(vel_targets)
+                    self.control.joint_target_qd.assign(vel_targets)
 
             for s in range(self.sim_substeps):
                 self.states[0].clear_forces()
@@ -1771,14 +1879,15 @@ class DynamicSession:
             body_q_np = self.states[0].body_q.numpy()
             if np.any(np.isnan(body_q_np)):
                 log.warning(
-                    "NaN detected at session frame %d; halting drive", self.total_frames
+                    "NaN detected at session frame %d; halting drive",
+                    self._sim_frame_count,
                 )
                 self._nan_seen = True
                 return False
 
             # Per-frame arm tracking-error accumulator (target vs measured).
             joint_q_np = self.states[0].joint_q.numpy()
-            tgt_q_np = self.control.joint_target_pos.numpy()
+            tgt_q_np = self.control.joint_target_q.numpy()
             arm_err = np.abs(
                 tgt_q_np[self._arm_q_offsets] - joint_q_np[self._arm_q_offsets]
             )
@@ -1786,7 +1895,12 @@ class DynamicSession:
             self._track_err_sq_sum += arm_err * arm_err
             self._track_err_n += 1
 
-            self._record_frame(phase_per_frame[t])
+            phase = phase_per_frame[t]
+            if record_frames:
+                self._record_frame(phase)
+            self._sim_frame_count += 1
+            if frame_callback is not None:
+                frame_callback(self, phase)
 
         return True
 

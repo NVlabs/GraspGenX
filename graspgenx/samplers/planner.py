@@ -7,14 +7,14 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 import torch
 
 from graspgenx.grasp_server import GraspGenXSampler
-from graspgenx.utils.point_cloud import point_cloud_outlier_removal
 from graspgenx.samplers.graspmoe import run_graspmoe, run_graspmoe_batch
+from graspgenx.utils.point_cloud import point_cloud_outlier_removal
 
 
 def run_planner_on_object(
@@ -23,14 +23,14 @@ def run_planner_on_object(
     *,
     planner: str = "graspmoe",
     grasp_threshold: float = -1.0,
-    num_grasps: int = 200,
+    num_grasps: int | None = None,
     topk_num_grasps: int = -1,
-    moe_num_yaws: int = 36,
-    moe_z_offsets_cm: Sequence[float] = (-8, -6, -4, -2, -1, 0),
+    moe_num_yaws: int | None = None,
+    moe_z_offsets_cm: Sequence[float] = (-8, -6, -4, -2, 0),
     moe_outlier_threshold: float = 0.014,
     moe_outlier_k: int = 20,
-    moe_obb_mode: str = "advanced",
-    moe_skip_obb_rule: str = "auto",
+    moe_obb_mode: str = "pca",
+    moe_skip_obb_rule: str = "never",
     moe_obb_density: str = "sparse",
     moe_obb_position_spacing_cm: float = 1.0,
 ):
@@ -98,27 +98,29 @@ def run_planner_on_batch(
     *,
     planner: str = "graspmoe",
     grasp_threshold: float = -1.0,
-    num_grasps: int = 200,
+    num_grasps: int | None = None,
     topk_num_grasps: int = -1,
-    moe_num_yaws: int = 36,
-    moe_z_offsets_cm: Sequence[float] = (-8, -6, -4, -2, -1, 0),
+    moe_num_yaws: int | None = None,
+    moe_z_offsets_cm: Sequence[float] = (-8, -6, -4, -2, 0),
     moe_outlier_threshold: float = 0.014,
     moe_outlier_k: int = 20,
-    moe_obb_mode: str = "advanced",
-    moe_skip_obb_rule: str = "auto",
+    moe_obb_mode: str = "pca",
+    moe_skip_obb_rule: str = "never",
     moe_obb_density: str = "sparse",
     moe_obb_position_spacing_cm: float = 1.0,
+    object_batch_size: int | None = None,
 ) -> list:
     """Batched form of :func:`run_planner_on_object`. Returns one
     ``(grasps_world, grasp_conf, branch_tags, obb_dict_or_None)`` tuple per
     input PC, in input order.
 
-    For the GraspMoE planner this folds the diffusion forward pass into a
-    single batched call; the OBB branch and its discriminator scoring stay
-    per-object (each object has variable OBB candidate counts).
+    Eager PyTorch may fold the GraspMoE diffusion branch into a batched call;
+    the optimized runtime loops over objects because each object has its own
+    fixed-shape CUDA Graph.
 
-    For the diffusion baseline planner the inference call is also batched
-    via :meth:`GraspGenXSampler.run_inference_batch`.
+    The optimized diffusion runtime always uses one-object calls in a loop.
+    Eager PyTorch can still batch multiple objects through
+    :meth:`GraspGenXSampler.run_inference_batch`.
     """
     n = len(object_pcs)
     if n == 0:
@@ -148,28 +150,32 @@ def run_planner_on_batch(
             results.append((grasps, conf, tags, moe["obb"]))
         return results
 
-    # Diffusion baseline: batch the inference call, per-object outlier removal.
-    filtered_pcs: list = []
-    for pc in object_pcs:
-        pc_t = (
-            torch.from_numpy(pc.astype(np.float32))
-            if isinstance(pc, np.ndarray)
-            else pc.float()
+    # Diffusion-only path: move each variable-length cloud to CUDA and apply
+    # the exact fused filter/resampler there. The C++ runtime uses chunks of one;
+    # eager PyTorch may use a larger object batch.
+    if grasp_sampler.using_fast_inference:
+        if object_batch_size not in (None, 1):
+            raise ValueError(
+                "The native C++ runtime supports object_batch_size=1 "
+                "only; loop over objects for larger batches."
+            )
+        object_batch_size = 1
+    elif object_batch_size is None or object_batch_size == 0:
+        object_batch_size = n
+    if object_batch_size < 1:
+        raise ValueError("object_batch_size must be positive or zero for all")
+    diff_results = []
+    for start in range(0, n, object_batch_size):
+        diff_results.extend(
+            GraspGenXSampler.run_inference_batch(
+                object_pcs[start : start + object_batch_size],
+                grasp_sampler,
+                grasp_threshold=grasp_threshold,
+                num_grasps=num_grasps,
+                topk_num_grasps=topk_num_grasps,
+                remove_outliers=True,
+            )
         )
-        f_t, _ = point_cloud_outlier_removal(pc_t)
-        if len(f_t) < 10:
-            # Outlier removal nuked (nearly) everything — fall back to the raw PC.
-            f_t = pc_t
-        filtered_pcs.append(f_t.cpu().numpy())
-
-    diff_results = GraspGenXSampler.run_inference_batch(
-        filtered_pcs,
-        grasp_sampler,
-        grasp_threshold=grasp_threshold,
-        num_grasps=num_grasps,
-        topk_num_grasps=topk_num_grasps,
-        remove_outliers=False,
-    )
     results = []
     for grasps_t, conf_t in diff_results:
         if len(grasps_t) == 0:

@@ -647,7 +647,11 @@ class GraspGenGenerator(nn.Module):
         if self.kappa is not None:
             depth = self.kappa * depth
 
-        if self.object_backbone in ("ptv3", "ptv3vanilla"):
+        cached_object_embedding = data.get("_generator_object_embedding", None)
+        if cached_object_embedding is None and self.object_backbone in (
+            "ptv3",
+            "ptv3vanilla",
+        ):
             depth = convert_to_ptv3_pc_format(depth, grid_size=self.grid_size)
 
         grasps_per_iteration = torch.zeros(
@@ -657,7 +661,8 @@ class GraspGenGenerator(nn.Module):
                 num_grasps_per_batch,
                 4,
                 4,
-            ]
+            ],
+            device=device,
         )
 
         with torch.no_grad():
@@ -676,9 +681,12 @@ class GraspGenGenerator(nn.Module):
             mask_batch = offset2batch(offset)
 
             if self.pose_repr == "mlp":
-                object_embedding = self.object_encoder(
-                    depth
-                )  # object_embedding size is [num_objects_in_batch, self.num_object_dim]
+                if cached_object_embedding is None:
+                    object_embedding = self.object_encoder(
+                        depth
+                    )  # [num_objects_in_batch, self.num_object_dim]
+                else:
+                    object_embedding = cached_object_embedding
                 object_embedding = object_embedding[
                     mask_batch
                 ]  # Redistribute object embeddings to full batch, result is [batch_size, self.num_object_dim]
@@ -850,7 +858,7 @@ class GraspGenGenerator(nn.Module):
                         likelihood_pos = (
                             torch.distributions.Normal(
                                 res_pos.pred_original_sample,
-                                torch.sqrt(torch.tensor(var_pos, device=device)),
+                                torch.sqrt(torch.as_tensor(var_pos, device=device)),
                             )
                             .log_prob(noisy_grasps[..., :3])
                             .sum(-1, keepdim=True)
@@ -862,7 +870,7 @@ class GraspGenGenerator(nn.Module):
                         likelihood_rot = (
                             torch.distributions.Normal(
                                 res_rot.pred_original_sample,
-                                torch.sqrt(torch.tensor(var_rot, device=device)),
+                                torch.sqrt(torch.as_tensor(var_rot, device=device)),
                             )
                             .log_prob(noisy_grasps[..., 3 : self.output_dim])
                             .sum(-1, keepdim=True)
@@ -887,7 +895,7 @@ class GraspGenGenerator(nn.Module):
                         likelihood += (
                             torch.distributions.Normal(
                                 res.pred_original_sample,
-                                torch.sqrt(torch.tensor(var, device=device)),
+                                torch.sqrt(torch.as_tensor(var, device=device)),
                             )
                             .log_prob(noisy_grasps)
                             .sum(-1, keepdim=True)

@@ -11,7 +11,7 @@ natively):
   ``{"default_gripper": str|None, "loaded_grippers": [str], "model": {...}}``
 * ``{"action": "infer", "point_cloud": (N,3) float32,
        "gripper_name": str (optional, falls back to default),
-       "num_grasps": int = 200,
+       "num_grasps": int = 100,
        "grasp_threshold": float = -1.0,
        "topk_num_grasps": int = 100}`` →
   ``{"grasps": (K,4,4) float32, "confidences": (K,) float32,
@@ -49,11 +49,9 @@ Any unhandled error is returned as ``{"error": str(exc)}`` — the client raises
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import msgpack
 import msgpack_numpy
@@ -85,13 +83,13 @@ ACTIONS = (
 # actions return ALL generated grasps with their scores; thresholding and
 # top-k selection are the client's job.
 PLANNER_KNOB_DEFAULTS = {
-    "num_grasps": 200,
-    "moe_num_yaws": 36,
-    "moe_z_offsets_cm": (-8.0, -6.0, -4.0, -2.0, -1.0, 0.0),
+    "num_grasps": 100,
+    "moe_num_yaws": None,
+    "moe_z_offsets_cm": (-8.0, -6.0, -4.0, -2.0, 0.0),
     "moe_outlier_threshold": 0.014,
     "moe_outlier_k": 20,
-    "moe_obb_mode": "advanced",
-    "moe_skip_obb_rule": "auto",
+    "moe_obb_mode": "pca",
+    "moe_skip_obb_rule": "never",
     "moe_obb_density": "sparse",
     "moe_obb_position_spacing_cm": 1.0,
 }
@@ -124,20 +122,18 @@ class GraspGenXZMQServer:
         assets_dir: str,
         host: str = "0.0.0.0",
         port: int = 5556,
-        default_gripper: Optional[str] = None,
-        use_tensorrt: bool = False,
-        tensorrt_precision: str = "fp32",
+        default_gripper: str | None = None,
+        use_fast_inference: bool = False,
     ) -> None:
         self.assets_dir = str(Path(assets_dir).expanduser().resolve())
         self.host = host
         self.port = port
         self.default_gripper = default_gripper
-        self.use_tensorrt = use_tensorrt
-        self.tensorrt_precision = tensorrt_precision
-        self._tensorrt_applied = False
+        self.use_fast_inference = use_fast_inference
+        self._fast_inference_enabled = False
 
         self.cfg = self._load_cfg(config_path)
-        self._samplers: Dict[str, GraspGenXSampler] = {}
+        self._samplers: dict[str, GraspGenXSampler] = {}
         self._samplers_lock = threading.Lock()
         # The GraspGen model is gripper-independent; load it eagerly at
         # startup and share it across every sampler (name-based and
@@ -146,28 +142,20 @@ class GraspGenXZMQServer:
         self._shared_model = load_grasp_gen_model(self.cfg)
         logger.info("Model loaded.")
 
-        if use_tensorrt:
+        if use_fast_inference:
             from types import SimpleNamespace
 
-            from graspgenx.models.tensorrt_utils import accelerate_sampler
-            from graspgenx.samplers.graspmoe import set_gpu_obb
+            from graspgenx.fast_inference import install_fast_runtime
 
-            # accelerate_sampler mutates sampler.model in place; the shim lets
+            # The accelerator mutates sampler.model in place; the shim lets
             # us accelerate the shared model once, before any sampler exists.
-            self._tensorrt_applied = accelerate_sampler(
-                SimpleNamespace(model=self._shared_model),
-                precision=tensorrt_precision,
+            self._fast_inference_enabled = install_fast_runtime(
+                SimpleNamespace(model=self._shared_model)
             )
-            if self._tensorrt_applied:
-                logger.info(
-                    "Diffusion denoiser accelerated with TensorRT (%s).",
-                    tensorrt_precision,
-                )
-                set_gpu_obb(True)
+            if self._fast_inference_enabled:
+                logger.info("Native C++ fast inference enabled.")
             else:
-                logger.warning(
-                    "TensorRT acceleration not applied; using eager PyTorch."
-                )
+                logger.warning("Fast inference not enabled; using eager PyTorch.")
 
         if default_gripper:
             logger.info("Pre-loading default gripper: %s", default_gripper)
@@ -205,12 +193,11 @@ class GraspGenXZMQServer:
                     assets_dir=self.assets_dir,
                     model=self._shared_model,
                 )
+                sampler.using_fast_inference = self._fast_inference_enabled
                 self._samplers[gripper_name] = sampler
             return sampler
 
-    def _get_sampler_from_params(
-        self, params: SweepVolumeParams
-    ) -> GraspGenXSampler:
+    def _get_sampler_from_params(self, params: SweepVolumeParams) -> GraspGenXSampler:
         key = "sweep:" + params.cache_key()
         with self._samplers_lock:
             sampler = self._samplers.get(key)
@@ -219,6 +206,7 @@ class GraspGenXZMQServer:
                 sampler = GraspGenXSampler.from_sweep_volume(
                     self.cfg, params, model=self._shared_model
                 )
+                sampler.using_fast_inference = self._fast_inference_enabled
                 self._samplers[key] = sampler
             return sampler
 
@@ -253,7 +241,9 @@ class GraspGenXZMQServer:
         kwargs = {"planner": planner}
         for key, default in PLANNER_KNOB_DEFAULTS.items():
             value = request.get(key, default)
-            if key == "moe_z_offsets_cm":
+            if value is None:
+                pass
+            elif key == "moe_z_offsets_cm":
                 value = tuple(float(x) for x in value)
             elif isinstance(default, int):
                 value = int(value)
@@ -286,11 +276,13 @@ class GraspGenXZMQServer:
             "assets_dir": self.assets_dir,
             "actions": list(ACTIONS),
             "precision": {
-                "weights": "fp32",
-                "tensorrt": bool(self._tensorrt_applied),
-                "tensorrt_precision": (
-                    self.tensorrt_precision if self._tensorrt_applied else None
+                "fast_inference": bool(self._fast_inference_enabled),
+                "backend": (
+                    "cpp_runtime" if self._fast_inference_enabled else "pytorch"
                 ),
+                "ptv3": "fp16" if self._fast_inference_enabled else "fp32",
+                "diffusion": "fp16" if self._fast_inference_enabled else "fp32",
+                "scorer": "fp32",
             },
         }
 
@@ -298,7 +290,9 @@ class GraspGenXZMQServer:
     def _validate_object_pc(point_cloud) -> np.ndarray:
         if point_cloud is None:
             raise ValueError("Request is missing 'point_cloud'.")
-        pc = np.asarray(point_cloud, dtype=np.float32)
+        # msgpack-numpy decodes arrays over an immutable byte buffer. Make the
+        # ownership explicit before torch.from_numpy consumes it downstream.
+        pc = np.array(point_cloud, dtype=np.float32, order="C", copy=True)
         if pc.ndim != 2 or pc.shape[1] != 3 or len(pc) == 0:
             raise ValueError(f"point_cloud must be non-empty (N, 3); got {pc.shape}")
         return pc
@@ -365,7 +359,9 @@ class GraspGenXZMQServer:
         point_cloud = request.get("point_cloud")
         if point_cloud is None:
             raise ValueError("Request is missing 'point_cloud'.")
-        pc = np.asarray(point_cloud, dtype=np.float32)
+        # msgpack-numpy decodes arrays over an immutable byte buffer. Make the
+        # ownership explicit before torch.from_numpy consumes it downstream.
+        pc = np.array(point_cloud, dtype=np.float32, order="C", copy=True)
         if pc.ndim == 3 and pc.shape[-1] == 3:
             pc = pc.reshape(-1, 3)
         elif pc.ndim != 2 or pc.shape[-1] != 3:
@@ -382,7 +378,7 @@ class GraspGenXZMQServer:
 
     @staticmethod
     def _validate_instance_mask(
-        mask, expected_shape: Optional[tuple] = None, expected_size: Optional[int] = None
+        mask, expected_shape: tuple | None = None, expected_size: int | None = None
     ) -> np.ndarray:
         if mask is None:
             raise ValueError("Request is missing 'instance_mask'.")
@@ -423,9 +419,9 @@ class GraspGenXZMQServer:
         sampler = self._get_sampler_from_params(params)
 
         candidate_ids = np.unique(labels_flat[valid_flat & (labels_flat > 0)])
-        instance_pcs: List[np.ndarray] = []
-        instance_ids: List[int] = []
-        skipped_ids: List[int] = []
+        instance_pcs: list[np.ndarray] = []
+        instance_ids: list[int] = []
+        skipped_ids: list[int] = []
         for inst_id in candidate_ids.tolist():
             pts = xyz_flat[valid_flat & (labels_flat == inst_id)]
             if len(pts) < min_object_points:
@@ -438,10 +434,10 @@ class GraspGenXZMQServer:
         batch_results = run_planner_on_batch(instance_pcs, sampler, **knobs)
         infer_ms = (time.monotonic() - t0) * 1000.0
 
-        out_ids: List[int] = []
-        out_grasps: List[np.ndarray] = []
-        out_conf: List[np.ndarray] = []
-        out_tags: List[List[str]] = []
+        out_ids: list[int] = []
+        out_grasps: list[np.ndarray] = []
+        out_conf: list[np.ndarray] = []
+        out_tags: list[list[str]] = []
         for inst_id, (grasps, conf, tags, _) in zip(instance_ids, batch_results):
             if len(grasps) == 0:
                 skipped_ids.append(inst_id)
@@ -469,11 +465,13 @@ class GraspGenXZMQServer:
         point_cloud = request.get("point_cloud")
         if point_cloud is None:
             raise ValueError("Request is missing 'point_cloud'.")
-        pc = np.asarray(point_cloud, dtype=np.float32)
+        # msgpack-numpy decodes arrays over an immutable byte buffer. Make the
+        # ownership explicit before torch.from_numpy consumes it downstream.
+        pc = np.array(point_cloud, dtype=np.float32, order="C", copy=True)
         if pc.ndim != 2 or pc.shape[1] != 3:
             raise ValueError(f"point_cloud must be (N, 3); got {pc.shape}")
 
-        num_grasps = int(request.get("num_grasps", 200))
+        num_grasps = int(request.get("num_grasps", 100))
         grasp_threshold = float(request.get("grasp_threshold", -1.0))
         topk_num_grasps = int(request.get("topk_num_grasps", 100))
 
@@ -536,8 +534,8 @@ class GraspGenXZMQServer:
                 try:
                     request = msgpack.unpackb(raw, raw=False)
                     response = self._dispatch(request)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Request failed: %s", exc)
+                except Exception as exc:
+                    logger.exception("Request failed")
                     response = {"error": f"{type(exc).__name__}: {exc}"}
                 sock.send(msgpack.packb(response, use_bin_type=True))
         except KeyboardInterrupt:

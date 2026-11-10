@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -15,22 +14,22 @@ from graspgenx.models.ptv3.ptv3_vanilla import (
 )
 from graspgenx.models.model_utils import convert_to_ptv3_pc_format
 
-
 # Small config for fast tests
-SMALL_CFG = dict(
-    in_channels=3,
-    output_dim=64,
-    enc_depths=(1, 1, 1, 2, 1),
-    enc_channels=(16, 32, 64, 128, 256),
-    enc_num_head=(2, 4, 8, 8, 16),
-    enc_patch_size=(128, 128, 128, 128, 128),
-    drop_path=0.0,
-)
+SMALL_CFG = {
+    "in_channels": 3,
+    "output_dim": 64,
+    "enc_depths": (1, 1, 1, 2, 1),
+    "enc_channels": (16, 32, 64, 128, 256),
+    "enc_num_head": (2, 4, 8, 8, 16),
+    "enc_patch_size": (128, 128, 128, 128, 128),
+    "drop_path": 0.0,
+}
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ── HashSparseConv3d ─────────────────────────────────────────────────
+
 
 class TestHashSparseConv3d:
     def test_output_shape(self):
@@ -67,13 +66,15 @@ class TestHashSparseConv3d:
         N = 60
         feat = torch.randn(N, 3, device=DEVICE)
         grid_coord = torch.randint(0, 15, (N, 3), device=DEVICE)
-        batch = torch.cat([torch.zeros(30, dtype=torch.long),
-                           torch.ones(30, dtype=torch.long)]).to(DEVICE)
+        batch = torch.cat(
+            [torch.zeros(30, dtype=torch.long), torch.ones(30, dtype=torch.long)]
+        ).to(DEVICE)
         out = conv(feat, grid_coord, batch)
         assert out.shape == (N, 8)
 
 
 # ── segment_csr_vanilla ──────────────────────────────────────────────
+
 
 class TestSegmentCSR:
     def test_mean(self):
@@ -100,6 +101,7 @@ class TestSegmentCSR:
 
 # ── VanillaPoint serialization ────────────────────────────────────────
 
+
 class TestVanillaPoint:
     def test_serialization(self):
         N = 64
@@ -116,8 +118,33 @@ class TestVanillaPoint:
         assert point.serialized_code.shape[0] == 2  # two orders
         assert point.serialized_code.shape[1] == N
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_neighbor_map_on_cuda_with_duplicates(self):
+        torch.manual_seed(9)
+        conv = HashSparseConv3d(3, 8, kernel_size=3).cuda()
+        grid = torch.randint(0, 20, (400, 3), dtype=torch.int32, device="cuda")
+        grid[1] = grid[0]
+        batch = torch.randint(0, 3, (400,), dtype=torch.long, device="cuda")
+        actual_indices, actual_mask = conv.build_neighbor_map(grid, batch)
+
+        keys = conv._hash(batch, grid)
+        sorted_keys, sort_indices = keys.sort()
+        neighbor_grid = grid[:, None] + conv.offsets[None]
+        neighbor_batch = batch[:, None].expand(-1, len(conv.offsets))
+        neighbor_keys = conv._hash(
+            neighbor_batch.reshape(-1), neighbor_grid.reshape(-1, 3)
+        )
+        positions = torch.searchsorted(sorted_keys, neighbor_keys).clamp(
+            max=len(grid) - 1
+        )
+        expected_mask = (sorted_keys[positions] == neighbor_keys).view_as(actual_mask)
+        expected_indices = sort_indices[positions].view_as(actual_indices)
+        assert torch.equal(actual_mask, expected_mask)
+        assert torch.equal(actual_indices, expected_indices)
+
 
 # ── Full model ────────────────────────────────────────────────────────
+
 
 class TestPointTransformerV3Vanilla:
     @pytest.fixture
@@ -141,8 +168,11 @@ class TestPointTransformerV3Vanilla:
         loss = out.sum()
         loss.backward()
         # Check that model parameters received gradients
-        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
-                       for p in model.parameters() if p.requires_grad)
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in model.parameters()
+            if p.requires_grad
+        )
         assert has_grad, "No gradients flowed to model parameters"
 
     def test_single_batch(self, model):

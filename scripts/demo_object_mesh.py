@@ -10,7 +10,6 @@ import threading
 from pathlib import Path
 
 import numpy as np
-import torch
 import trimesh
 import trimesh.transformations as tra
 
@@ -116,6 +115,15 @@ def parse_args():
         type=str,
         default="",
         help="Path to save the output grasps in YAML format. If empty, grasps are not saved.",
+    )
+    parser.add_argument(
+        "--output_pose_npy",
+        type=str,
+        default="",
+        help=(
+            "Path to save object-local grasp transforms as a poses-only "
+            "float32 array with shape [K, 4, 4]. Confidence scores are not saved."
+        ),
     )
     parser.add_argument(
         "--no-visualization",
@@ -267,6 +275,15 @@ def process_single_mesh(args, mesh_file, grasp_sampler, gripper, vis):
         print(f"Saving predicted grasps to {args.output_file}")
         save_to_isaac_grasp_format(
             grasps_original_frame, grasp_conf_inferred, args.output_file
+        )
+    if args.output_pose_npy != "":
+        output_pose_npy = Path(args.output_pose_npy).expanduser().resolve()
+        output_pose_npy.parent.mkdir(parents=True, exist_ok=True)
+        poses = np.ascontiguousarray(grasps_original_frame, dtype=np.float32)
+        np.save(output_pose_npy, poses, allow_pickle=False)
+        print(
+            f"Saved {len(poses)} object-local grasp poses [K,4,4] to "
+            f"{output_pose_npy} (no confidence scores)"
         )
 
     return grasp_handles, top_mesh_handle, grasp_conf_inferred, best_idx

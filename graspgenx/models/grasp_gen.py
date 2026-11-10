@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import glob
+import os
+
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
@@ -54,19 +55,10 @@ class GraspGen(nn.Module):
         )
 
     def forward(self, data):
-        """Forward pass combining generation and discrimination.
-
-        Args:
-            data: Input data dictionary containing point clouds
-
-        Returns:
-            tuple: (outputs, losses, stats) containing generated and scored grasps
-        """
+        """Generate diffusion grasps and score them with the eager model."""
         outputs, _, stats = self.grasp_generator.infer(data, return_metrics=True)
         data.update(outputs)
-        data["grasp_key"] = (
-            "grasps_pred"  # Override to run discriminator inference on grasps predicted from previous step.
-        )
+        data["grasp_key"] = "grasps_pred"
         outputs, _, _ = self.grasp_discriminator.infer(data)
         return outputs, {}, stats
 

@@ -3,10 +3,12 @@
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 import numpy as np
 import trimesh
+from demo_object_pc import _resolve_default_checkpoints
 
 from graspgenx.grasp_server import GraspGenXSampler
 from graspgenx.samplers import run_planner_on_batch
@@ -22,13 +24,10 @@ from graspgenx.utils.viser_utils import (
     create_visualizer,
     get_color_from_score,
     visualize_bbox,
-    visualize_x_grasp,
     visualize_mesh,
     visualize_pointcloud,
+    visualize_x_grasp,
 )
-
-from graspgenx.utils.point_cloud import point_cloud_outlier_removal
-from demo_object_pc import _resolve_default_checkpoints
 
 
 def parse_args():
@@ -59,20 +58,20 @@ def parse_args():
         default="graspmoe",
         choices=["diffusion", "graspmoe"],
     )
-    parser.add_argument("--moe_num_yaws", type=int, default=36)
-    parser.add_argument("--moe_z_offsets_cm", type=str, default="-2,0")
+    parser.add_argument("--moe_num_yaws", type=int, default=None)
+    parser.add_argument("--moe_z_offsets_cm", type=str, default="-8,-6,-4,-2,0")
     parser.add_argument("--moe_outlier_threshold", type=float, default=0.014)
     parser.add_argument("--moe_outlier_k", type=int, default=20)
     parser.add_argument(
-        "--moe_obb_mode", type=str, default="advanced", choices=["advanced", "pca"]
+        "--moe_obb_mode", type=str, default="pca", choices=["advanced", "pca"]
     )
     parser.add_argument(
-        "--moe_skip_obb_rule", type=str, default="auto", choices=["auto", "never"]
+        "--moe_skip_obb_rule", type=str, default="never", choices=["auto", "never"]
     )
     parser.add_argument(
         "--moe_obb_density",
         type=str,
-        default="dense-topandside",
+        default="sparse",
         choices=["sparse", "dense", "dense-topandside"],
         help="OBB candidate placement. 'sparse' (default): single (x,y) at the OBB "
         "centroid, top-down only. 'dense': sweep positions along the OBB's longer "
@@ -109,18 +108,10 @@ def parse_args():
         help="Real-world format only: skip objects whose segmented PC has fewer points.",
     )
     parser.add_argument(
-        "--tensorrt",
+        "--fast-inference",
         action="store_true",
-        help="Accelerate the diffusion/discriminator heads with TensorRT "
-        "(opt-in; requires a working torch_tensorrt). Falls back to eager if "
-        "unavailable.",
-    )
-    parser.add_argument(
-        "--tensorrt_precision",
-        type=str,
-        default="fp32",
-        choices=["fp32", "fp16"],
-        help="TensorRT precision when --tensorrt is set (default fp32).",
+        help="Use the one-object native C++ fast-inference runtime "
+        "(requires the 'fast-inference' extra).",
     )
     parser.add_argument(
         "--filter_collisions",
@@ -214,7 +205,7 @@ def visualize_grasps_for_object(
             visualize_mesh(
                 vis,
                 mesh_ns,
-                gripper.collision_mesh,
+                gripper.visual_mesh,
                 color=scores[j],
                 transform=grasp,
             )
@@ -223,7 +214,7 @@ def visualize_grasps_for_object(
         visualize_mesh(
             vis,
             f"{ns_prefix}/top_grasp_mesh",
-            gripper.collision_mesh,
+            gripper.visual_mesh,
             color=[0, 100, 255],
             transform=grasps[best_idx],
         )
@@ -257,18 +248,44 @@ def main():
 
     print(f"Loading gripper: {args.gripper_name}")
     print(f"Assets directory: {args.assets_dir}")
+    z_offsets_cm = tuple(float(x) for x in args.moe_z_offsets_cm.split(","))
     grasp_sampler = GraspGenXSampler(
         model_cfg,
         args.gripper_name,
         assets_dir=args.assets_dir,
-        use_tensorrt=args.tensorrt,
-        tensorrt_precision=args.tensorrt_precision,
+        use_fast_inference=args.fast_inference,
+        diffusion_grasps=args.num_grasps,
+        obb_grasps=(args.moe_num_yaws or 10) * len(z_offsets_cm),
     )
+    if args.fast_inference and not grasp_sampler.using_fast_inference:
+        raise RuntimeError(
+            "--fast-inference was requested, but the native optimized backend could "
+            "not be enabled; see the preceding warning for the root cause."
+        )
+    backend = (
+        "native C++ fast runtime" if grasp_sampler.using_fast_inference else "PyTorch"
+    )
+    print(f"Inference backend: {backend}")
     gripper = grasp_sampler.get_gripper_info()
 
-    vis = create_visualizer()
+    collision_mesh_available = (
+        gripper.collision_mesh is not None and len(gripper.collision_mesh.faces) > 0
+    )
+    visual_mesh_available = (
+        gripper.visual_mesh is not None and len(gripper.visual_mesh.faces) > 0
+    )
+    if not collision_mesh_available and args.filter_collisions:
+        print("Gripper collision mesh is empty; disabling collision filtering.")
+        args.filter_collisions = False
+    if not visual_mesh_available and (args.plot_mesh or args.plot_top_mesh):
+        print(
+            "Gripper visual mesh is empty; disabling mesh overlays. Grasp "
+            "frames will still be visualized."
+        )
+        args.plot_mesh = False
+        args.plot_top_mesh = False
 
-    z_offsets_cm = tuple(float(x) for x in args.moe_z_offsets_cm.split(","))
+    vis = create_visualizer()
 
     # Sample the gripper collision mesh once and reuse for every collision
     # check (same mesh, same random sampling reasonable across the run).
@@ -316,22 +333,47 @@ def main():
                 size=0.004,
             )
 
-        # One batched diffusion forward pass across every object in this scene.
+        planner_kwargs = {
+            "planner": args.planner,
+            "grasp_threshold": args.grasp_threshold,
+            "num_grasps": args.num_grasps,
+            "topk_num_grasps": args.topk_num_grasps,
+            "moe_num_yaws": args.moe_num_yaws,
+            "moe_z_offsets_cm": z_offsets_cm,
+            "moe_outlier_threshold": args.moe_outlier_threshold,
+            "moe_outlier_k": args.moe_outlier_k,
+            "moe_obb_mode": args.moe_obb_mode,
+            "moe_skip_obb_rule": args.moe_skip_obb_rule,
+            "moe_obb_density": args.moe_obb_density,
+            "moe_obb_position_spacing_cm": args.moe_obb_position_spacing_cm,
+            "object_batch_size": (
+                1
+                if grasp_sampler.using_fast_inference and args.planner == "diffusion"
+                else None
+            ),
+        }
+        if grasp_sampler.using_fast_inference:
+            # Engine deserialization and CUDA-Graph capture are process startup
+            # costs. Warm the one-object plan once so the displayed
+            # number is steady-state inference, matching the benchmark contract.
+            warmup_count = min(1, len(obj_pcs))
+            print("  Warming native one-object runtime...")
+            run_planner_on_batch(
+                obj_pcs[:warmup_count], grasp_sampler, **planner_kwargs
+            )
+
+        inference_start = time.perf_counter()
         batch_results = run_planner_on_batch(
             obj_pcs,
             grasp_sampler,
-            planner=args.planner,
-            grasp_threshold=args.grasp_threshold,
-            num_grasps=args.num_grasps,
-            topk_num_grasps=args.topk_num_grasps,
-            moe_num_yaws=args.moe_num_yaws,
-            moe_z_offsets_cm=z_offsets_cm,
-            moe_outlier_threshold=args.moe_outlier_threshold,
-            moe_outlier_k=args.moe_outlier_k,
-            moe_obb_mode=args.moe_obb_mode,
-            moe_skip_obb_rule=args.moe_skip_obb_rule,
-            moe_obb_density=args.moe_obb_density,
-            moe_obb_position_spacing_cm=args.moe_obb_position_spacing_cm,
+            **planner_kwargs,
+        )
+        inference_seconds = time.perf_counter() - inference_start
+        print(
+            f"  Steady-state optimized {args.planner} inference: "
+            f"{inference_seconds * 1e3:.2f} ms total, "
+            f"{inference_seconds * 1e3 / len(labels):.2f} ms/object amortized "
+            f"({len(labels)} objects x {args.num_grasps} grasps)"
         )
 
         for label, (grasps, conf, tags, obb_dict) in zip(labels, batch_results):

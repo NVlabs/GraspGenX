@@ -41,33 +41,21 @@ GraspGenX is a cross-embodiment grasp generation framework that produces high-qu
 
 ## Contents
 
-1. [Release News](#release-news)
-2. [Upcoming Features](#upcoming-features)
-3. [Installation](#installation)
+1. [Installation](#installation)
    - [Docker](#installation-with-docker)
    - [uv Installation](#installation-with-uv)
-4. [Inference Demos](#inference-demos)
+   - [Fast-Inference Performance](#fast-inference-performance)
+2. [Inference Demos](#inference-demos)
    - [Object Point Clouds](#predicting-grasps-for-segmented-object-point-clouds)
    - [Object Meshes](#predicting-grasps-for-object-meshes)
-   - [Scene Point Clouds](#advanced-predicting-grasps-for-objects-from-scene-point-clouds)
-5. [End-to-End Demo And VLA Data Generation](#end-to-end-demos)
-6. [Integrating a New Gripper](#integrating-a-new-gripper)
-7. [Agentic Workflows](#agentic-workflows)
-8. [FAQ](#faq)
-9. [License](#license)
-10. [Citation](#citation)
-11. [Contact](#contact)
-
-## Release News
-
-- \[06/01/2026\] Initial code and model release!
-
-## Upcoming Features
-
-- Support for YAM gripper (feel free to contribute and make a PR!)
-- DROID VLA pick-and-place data generation (feel free to contribute and make a PR!)
-- Grasp Data Generation in Simulation (Newton)
-- Full Training Dataset release
+   - [Scene Point Clouds](#predicting-grasps-for-objects-from-scene-point-clouds)
+3. [End-to-End Demo And VLA Data Generation](#end-to-end-demos)
+4. [Integrating a New Gripper](#integrating-a-new-gripper)
+5. [Agentic Workflows](#agentic-workflows)
+6. [FAQ](#faq)
+7. [License](#license)
+8. [Citation](#citation)
+9. [Contact](#contact)
 
 ## Installation
 
@@ -79,14 +67,90 @@ Choose your preferred installation method. For training, we recommend **Docker**
 | **uv** | Inference | ⭐ |
 
 ### Installation with uv
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you don't have it, then:
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/). Eager
+PyTorch inference is the base install:
+
 ```bash
-git clone https://github.com/NVlabs/GraspGenX.git && cd GraspGenX && uv sync
+git clone https://github.com/NVlabs/GraspGenX.git && cd GraspGenX
+uv sync
 ```
-> **Note:** `pip install -e .` also works inside a conda or Python virtual environment with python=3.10/3.11 .
+
+Fast inference is a separate native C++ runtime. Build it on the target GPU:
+
+```bash
+uv run --quiet --extra fast-inference graspgenx-install-fast-inference \
+    --diffusion-grasps 100 \
+    --obb-grasps 50
+```
+
+The default encoder profile is `[3500,2048,1024,512,512]`. Use
+`--ptv3-capacities INPUT POOL1 POOL2 POOL3 POOL4` to build another profile.
+See [capacity profiles](cpp_runtime/README.md#configurable-ptv3-capacities)
+for supported limits and custom artifact directories.
+
+To install fast inference together with the Viser and rendering dependencies:
+
+```bash
+uv sync --quiet --extra fast-inference --extra visualization
+uv run --quiet --extra fast-inference --extra visualization graspgenx-install-fast-inference \
+    --diffusion-grasps 100 \
+    --obb-grasps 50
+```
+
+The installer command installs the Python build dependencies, downloads the
+released checkpoints when needed, exports GPU-specific TensorRT plans, builds
+the C++ runtime into the package search path, and runs an end-to-end smoke test.
+It reuses complete plans and incremental CMake output on subsequent runs. The
+installer shows only phase summaries by default and prints captured tool output
+if a command fails. Add `--verbose` to stream ONNX, TensorRT, and CMake output.
+
+TensorRT plan generation uses builder optimization level 2 by default for a
+reasonable install time. Add `--tensorrt-optimization-level 3` or
+`--tensorrt-optimization-level 5` to spend more build time searching for faster
+plans. Add `--force-artifacts` as well when rebuilding existing plans.
+
+The host still needs a CUDA toolkit with `nvcc` and matching TensorRT runtime
+and development headers (`libnvinfer` and `NvInfer.h`). For a nonstandard CUDA
+or TensorRT installation, pass `--cuda-root` or `--tensorrt-root`. On Jetson,
+the installer uses JetPack's system TensorRT Python package so plan generation
+matches the native TensorRT runtime exactly.
+
+Inside an existing conda or Python environment, use `pip install -e .` for
+PyTorch inference. Use the uv commands above for the complete native runtime;
+they select the CUDA 13 PyTorch and TensorRT packages together.
+
+Add `--extra visualization` only when running the Viser or rendering demos,
+`--extra usd` only for USD loading/export on supported platforms, and `--extra
+training` only for dataset and training utilities.
+
+See [Fast inference](FAST_INFERENCE.md) for the optimized pipeline and the
+[native C++ TensorRT runtime](cpp_runtime/README.md) for build and API details.
+
+### Fast-Inference Performance
+
+Measurements use the native C++ runtime, the released 20-step DDPM schedule,
+3,500 model input points, 100 diffusion candidates, and 50 analytic OBB
+candidates. Each result reports the mean of three independent process means;
+each process performs 300 CUDA Graph warmup replays followed by 300 timed
+replays. The timed boundary starts with a CUDA-resident point cloud and ends
+with ranked, CUDA-resident grasps and scores.
+
+| Target | 150 candidates (100 diffusion + 50 OBB) |
+|---|---:|
+| NVIDIA RTX 6000 Ada | 3.178 ms |
+
+Every benchmark output contains the exact requested count, finite poses and
+scores, descending confidence, deterministic replay, and no PTV3
+topology-capacity overflow.
+
+These measurements use TensorRT 10.16.1.11, the default capacity profile, and a
+synthetic object. They exclude initialization, plan construction, and input
+transfers. See the [benchmark guide](cpp_runtime/README.md#validation-and-benchmark)
+for commands and the [input limits](cpp_runtime/README.md#input-limits-and-concurrency).
 
 ### Installation with Docker
-Training has only been tested inside the Docker.
+Training support targets the Docker environment.
 ```bash
 git clone https://github.com/NVlabs/GraspGenX.git && cd GraspGenX && bash docker/build.sh
 ```
@@ -95,14 +159,14 @@ git clone https://github.com/NVlabs/GraspGenX.git && cd GraspGenX && bash docker
 
 ### Checkpoints
 
-The GraspGenX model checkpoints are downloaded automatically on the first import from [`https://huggingface.co/adithyamurali/GraspGenXModel`](https://huggingface.co/adithyamurali/GraspGenXModel) and cloned to `<repo_root>/ext/graspgenx_checkpoints`. If you have already cloned the checkpoints elsewhere, specify the path by setting the env variable:
+The GraspGenX model checkpoints download automatically on the first import from [`https://huggingface.co/adithyamurali/GraspGenXModel`](https://huggingface.co/adithyamurali/GraspGenXModel) and clone to `<repo_root>/ext/graspgenx_checkpoints`. If the checkpoints already exist elsewhere, specify the path with this environment variable:
 ```bash
 export GRASPGENX_CHECKPOINT_DIR=/path/to/your/graspgenx_checkpoints
 ```
 
 ### Gripper Config and Assets
 
-Each gripper needs a corresponding config file (with sweep volume information etc.) and URDF as an input to GraspGenX. We have already curated such gripper meta data for a host of popular grippers (see [gripper_descriptions](https://huggingface.co/datasets/adithyamurali/gripper_descriptions)). This package is needed at runtime for running inference on supported grippers. This package is automatically cloned on the first import to `<repo_root>/ext/gripper_descriptions`, but if you have downloaded it elsewhere you'll have to specify the following ENV variable:
+Each gripper needs a corresponding config file (with sweep volume information etc.) and URDF as an input to GraspGenX. We curate this gripper metadata for many popular grippers in [gripper_descriptions](https://huggingface.co/datasets/adithyamurali/gripper_descriptions). This package supports inference with those grippers and clones automatically on the first import to `<repo_root>/ext/gripper_descriptions`. If the package already exists elsewhere, specify its location with this environment variable:
 ```bash
 export GRASPGENX_GRIPPER_CFG_DIR=/path/to/your/gripper_descriptions
 ```
@@ -137,6 +201,15 @@ uv run python scripts/demo_object_pc.py \
     --plot_top_mesh
 ```
 
+Add `--fast-inference --num_grasps 100` to use the native C++ runtime with the
+100-diffusion-candidate plans built above. Candidate counts must match the
+installed plans. Python passes its
+CUDA point-cloud pointer and current stream through a small C ABI; C++ owns the
+complete PTV3, TensorRT, diffusion, OBB, scoring, ranking, and CUDA Graph
+pipeline. Set
+`GRASPGENX_CPP_RUNTIME_LIBRARY` and `GRASPGENX_CPP_RUNTIME_ARTIFACTS` if the
+library and artifacts are outside their default `cpp_runtime` locations.
+
 <table>
   <tr>
     <td><img src="assets/figs/obj_pc_robotiq1.png" width="300" height="250" title="obj_pc_1"></td>
@@ -146,7 +219,7 @@ uv run python scripts/demo_object_pc.py \
   </tr>
 </table>
 
-Replace `--gripper_name` with any supported gripper, e.g. `franka_umi`, `franka_panda`, `robotiq_2f_85`, `robotiq_2f_140`, `unitree_g1`, `inspire_hand`, `surge_hand`, `barrett_hand`, `galaxea_g1`, `ezgripper`. See [Supported Grippers](#supported-grippers) for the full list. By default the demo uses the **GraspMoE** planner (grasps sampled with diffusion ∪ Oriented-Bounding grasps, all scored by the discriminator). To fall back to the diffusion-only planner: `--planner diffusion`. To restrict the GraspMoE OBB sweep to the top face only: `--moe_obb_density sparse` (single centroid pose) or `--moe_obb_density dense` (positions along the OBB's longer XY axis, top-down only).
+Replace `--gripper_name` with any supported gripper, e.g. `franka_umi`, `franka_panda`, `robotiq_2f_85`, `robotiq_2f_140`, `unitree_g1`, `inspire_hand`, `surge_hand`, `barrett_hand`, `galaxea_g1`, `ezgripper`. Run `uv run python scripts/list_grippers.py` for the available grippers. By default the demo uses the **GraspMoE** planner (grasps sampled with diffusion ∪ Oriented-Bounding grasps, all scored by the discriminator). To fall back to the diffusion-only planner: `--planner diffusion`. To restrict the GraspMoE OBB sweep to the top face only: `--moe_obb_density sparse` (single centroid pose) or `--moe_obb_density dense` (positions along the OBB's longer XY axis, top-down only).
 
 ### Predicting grasps for objects from scene point clouds
 
@@ -155,8 +228,19 @@ The scene point cloud demo loads full-scene point clouds (with per-object segmen
 ```bash
 uv run python scripts/demo_scene_pc.py \
     --sample_data_dir assets/sample_data/real_world \
-    --gripper_name robotiq_2f_85
+    --scene 00 \
+    --gripper_name robotiq_2f_85 \
+    --planner diffusion \
+    --num_grasps 100 \
+    --fast-inference
 ```
+
+With `--fast-inference`, every segmented object uses the shared native C++ runtime.
+Scene objects are handled in a fast loop that reuses the same fixed one-object
+CUDA Graph, so arbitrary scene sizes do not create new runtime instances or
+TensorRT contexts. Scene `00` contains eight valid segmented objects after
+loader validation. The script prints total and amortized timing before adding
+the grasps to viser.
 
 <table cellspacing="20">
   <tr>
@@ -196,10 +280,10 @@ Supported mesh formats: `.obj`, `.stl`, `.ply`, and USD (`.usd`, `.usda`, `.usdc
 Beyond predicting grasps, [`end2end/`](end2end/README.md) wires GraspGenX into
 a full closed-loop pick-and-place pipeline: **GraspGenX** grasps → **cuRobo**
 collision-free motion planning → **Newton/MuJoCo** physics replay (gravity +
-contacts) → **MP4** render + **USD** export for IsaacSim / Omniverse. Four
+contacts) → **MP4** render + **USD** export for IsaacSim / Omniverse. Three
 example demos ship out of the box — a Franka Panda (single object → bin, and a
-3-object clutter scene → bin) and a UR10e with two multi-finger hands
-(arx_x5 pick-and-lift, surge_hand pick → bin).
+3-object clutter scene → bin) and a UR10e with a multi-finger hand
+(arx_x5 pick-and-lift).
 
 This pipeline needs an extra dependency stack (cuRobo, Newton, MuJoCo, CoACD,
 USD, fcl):
@@ -244,7 +328,7 @@ Open `http://localhost:8081` and step through the GUI. There are six panels — 
 
 ### What gets written
 
-On save, the wizard writes a fresh directory at `<gripper_descriptions_root>/assets/x_grippers/<name>/` (resolved via `$GRASPGENX_GRIPPER_CFG_DIR`, or the auto-cloned `<repo>/ext/gripper_descriptions/` — see [Gripper Descriptions Asset Repo](#gripper-descriptions-asset-repo)) containing:
+On save, the wizard writes a fresh directory at `<gripper_descriptions_root>/assets/x_grippers/<name>/` (resolved via `$GRASPGENX_GRIPPER_CFG_DIR`, or the auto-cloned `<repo>/ext/gripper_descriptions/` — see [Gripper Config and Assets](#gripper-config-and-assets)) containing:
 
 - `gripper.urdf` and `meshes/` — copied from your source URDF.
 - `config.json` — the open/close joint states, fingertip, swept-volume boxes, gripper type, and base rotation you annotated in the GUI. This is the file the model conditions on.
@@ -298,7 +382,7 @@ GraspGen trains a **separate model per gripper**. GraspGenX trains a **single mo
 
 ### What grippers does GraspGenX support?
 
-GraspGenX supports any gripper for which you can compute a swept volume. The released model was trained on 32 procedural grippers spanning 6 kinematic families (parallel 2-finger, revolute 2-finger, revolute 3-finger — each with two design variants). It generalizes zero-shot to multiple real-world grippers.
+GraspGenX supports any gripper for which you can compute a swept volume. The released model's training set contains 32 procedural grippers spanning 6 kinematic families (parallel 2-finger, revolute 2-finger, revolute 3-finger — each with two design variants). It generalizes zero-shot to multiple real-world grippers.
 
 ### How do I add a new gripper?
 

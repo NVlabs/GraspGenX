@@ -11,7 +11,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that e
 
 The MCP server is a lightweight bridge — it requires no CUDA, no model weights, and no dependency on the `graspgenx` package (the ZMQ wire protocol is inlined). It connects to a running GraspGenX ZMQ inference server and exposes its capabilities as MCP tools that any LLM agent can call.
 
-Unlike GraspGen (one gripper per server), GraspGenX loads a **single cross-embodiment model** and serves **any gripper**. You name the gripper per request (`gripper_name`), or describe it directly with raw **sweep-volume parameters** — so this bridge exposes both a name-based and a params-based path.
+GraspGenX serves grippers through one shared cross-embodiment model. You name the gripper per request (`gripper_name`), or describe it directly with raw **sweep-volume parameters** — so this bridge exposes both a name-based and a params-based path.
 
 ## Available Tools
 
@@ -32,9 +32,9 @@ The GraspGenX ZMQ server must be running. See the [client-server/README.md](../c
 
 ```bash
 # From the GraspGenX repo root:
-python client-server/graspgenx_server.py \
-    --config checkpoints/gen/config.yaml \
-    --assets_dir /code/assets \
+uv run --extra serve python client-server/graspgenx_server.py \
+    --config ext/graspgenx_checkpoints/release \
+    --assets_dir assets \
     --default_gripper franka_panda
 ```
 
