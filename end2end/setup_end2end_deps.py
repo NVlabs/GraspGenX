@@ -15,8 +15,8 @@ assets pulled — into ``ext/curobo``.
 ``gripper_descriptions`` / ``graspgenx_checkpoints`` are cloned into ``ext/``.
 
 It also re-installs cuRobo editable from that checkout, and builds the merged
-UR10e + arx_x5 URDF (the gitignored ``end2end/curobo_assets/`` artifact that
-example 3 needs).
+UR10e + arx_x5 and UR10e + Robotiq 2F-140 URDFs (the gitignored
+``end2end/curobo_assets/`` artifacts that the UR10e demos need).
 
 Idempotent. Run once after ``uv sync --extra end2end``:
 
@@ -101,36 +101,41 @@ def _ensure_curobo_assets() -> None:
     print(f"[setup-e2e] cuRobo assets ready at {CUROBO_DIR}")
 
 
-# Validated mount for the UR10e + arx_x5 merged URDF (rpy = -90°, -90°, 0).
-_ARX_MOUNT_RPY = ["-1.5708", "-1.5708", "0"]
+# Validated tool0 mounts (rpy) for the merged UR10e + <gripper> robots. Each
+# must match the grasp_to_tool_transform in end2end/robots/ur10e_<gripper>.yaml.
+UR10E_GRIPPER_MOUNTS = {
+    "arx_x5": ["-1.5708", "-1.5708", "0"],
+    "robotiq_2f_140": ["0", "0", "0"],
+}
 
 
-def _build_ur10e_arx() -> None:
-    """Generate the merged UR10e + arx_x5 URDF/YAML that example 3 needs.
+def _build_ur10e_gripper(gripper: str, mount_rpy: list[str]) -> None:
+    """Generate the merged UR10e + <gripper> URDF/YAML for the UR10e demos.
 
-    It's a gitignored build artifact under end2end/curobo_assets/, so build it
-    once here. Non-fatal: the Franka demos (examples 1-2) don't need it.
+    They're gitignored build artifacts under end2end/curobo_assets/, so build
+    them once here. Non-fatal: the Franka demos don't need them.
     """
-    merged = REPO_ROOT / "end2end" / "curobo_assets" / "ur10e_arx_x5.urdf"
-    if merged.is_file():
-        print(f"[setup-e2e] UR10e+arx_x5 URDF already built ({merged.name})")
+    assets = REPO_ROOT / "end2end" / "curobo_assets"
+    outputs = [assets / f"ur10e_{gripper}.urdf", assets / f"ur10e_{gripper}.yml"]
+    # Check both files: the URDF is written before sphere fitting, so a failed
+    # build can leave a URDF without its cuRobo YAML.
+    if all(p.is_file() for p in outputs):
+        print(f"[setup-e2e] UR10e+{gripper} already built ({outputs[0].name})")
         return
-    print("[setup-e2e] building merged UR10e + arx_x5 URDF (example 3)")
+    print(f"[setup-e2e] building merged UR10e + {gripper} URDF")
+    cmd = [
+        "uv", "run", "--no-sync", "python",
+        str(REPO_ROOT / "end2end" / "build_ur10e_gripper.py"),
+        "--gripper", gripper, "--mount_rpy", *mount_rpy,
+    ]
     # Run in the project venv (which now has the editable cuRobo) via uv.
-    res = subprocess.run(
-        ["uv", "run", "--no-sync", "python",
-         str(REPO_ROOT / "end2end" / "build_ur10e_gripper.py"),
-         "--gripper", "arx_x5", "--mount_rpy", *_ARX_MOUNT_RPY],
-        cwd=str(REPO_ROOT),
-    )
-    if res.returncode == 0 and merged.is_file():
-        print(f"[setup-e2e] UR10e+arx_x5 URDF ready ({merged})")
+    res = subprocess.run(cmd, cwd=str(REPO_ROOT))
+    if res.returncode == 0 and all(p.is_file() for p in outputs):
+        print(f"[setup-e2e] UR10e+{gripper} ready ({outputs[0]})")
     else:
         print(
-            "[setup-e2e] WARNING: UR10e+arx_x5 build failed — examples 1-2 "
-            "(Franka) still work. Rebuild later with: uv run --no-sync python "
-            "end2end/build_ur10e_gripper.py --gripper arx_x5 "
-            "--mount_rpy -1.5708 -1.5708 0"
+            f"[setup-e2e] WARNING: UR10e+{gripper} build failed — the Franka "
+            f"demos still work. Rebuild later with: {' '.join(cmd)}"
         )
 
 
@@ -150,8 +155,9 @@ def main() -> None:
         ["uv", "pip", "install", "-e", str(CUROBO_DIR), "--no-deps"], check=True
     )
 
-    # Build the merged UR10e + arx_x5 URDF that example 3 needs.
-    _build_ur10e_arx()
+    # Build the merged UR10e + <gripper> robots the UR10e demos need.
+    for gripper, mount_rpy in UR10E_GRIPPER_MOUNTS.items():
+        _build_ur10e_gripper(gripper, mount_rpy)
 
     print("[setup-e2e] done. Run end2end commands with `uv run --no-sync ...`.")
 

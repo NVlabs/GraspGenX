@@ -326,16 +326,26 @@ def run_clutter_task(
     # the viser counts and the picker scores stay consistent).
     gg_cfg = robot_cfg["graspgen"]
     gripper_name = gg_cfg["gripper_name"]
-    assets_dir = gg_cfg.get("assets_dir") or str(
-        Path(__file__).resolve().parent.parent
-        / "ext/gripper_descriptions/gripper_descriptions/assets"
-    )
-    vis_mesh_path = Path(assets_dir) / "x_grippers" / gripper_name / "vis_mesh.obj"
+    if gg_cfg.get("assets_dir"):
+        x_grippers = Path(gg_cfg["assets_dir"]) / "x_grippers"
+    else:
+        # Same resolution as the GraspGenX sampler: $GRASPGENX_GRIPPER_CFG_DIR,
+        # else the auto-cloned ext/gripper_descriptions.
+        from graspgenx._setup_dependencies import get_gripper_descriptions_assets
+
+        x_grippers = get_gripper_descriptions_assets()
+    vis_mesh_path = x_grippers / gripper_name / "vis_mesh.obj"
     if not vis_mesh_path.exists():
         raise FileNotFoundError(
             f"Smart-picker CF check needs gripper vis_mesh.obj at {vis_mesh_path}"
         )
     gripper_mesh = trimesh.load(str(vis_mesh_path), force="mesh")
+    if len(gripper_mesh.vertices) == 0:
+        # An un-pulled git-LFS pointer loads as an empty mesh and crashes fcl.
+        raise RuntimeError(
+            f"{vis_mesh_path} has no vertices (git-LFS pointer?). Run "
+            f"`git lfs pull` in {x_grippers.parents[2]}."
+        )
     # Static meshes (table, bin, ...) — every entry in bundle.vis_meshes
     # whose name is NOT one of the manipulation objects (those move).
     object_ids = {o.asset_id for o in bundle.objects}
