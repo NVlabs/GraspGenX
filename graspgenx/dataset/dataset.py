@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import time
+from copy import deepcopy
 from typing import Tuple, Union
 
 import h5py
@@ -713,7 +714,7 @@ class ObjectPickDataset(PickDataset):
 
             if key in self.cache:
                 object_grasp_data, outputs_red = self.cache[key]
-                outputs = copy(random.choice(outputs_red))
+                outputs = deepcopy(random.choice(outputs_red))
                 mesh_mode = outputs["mesh_mode"]
                 load_contact_batch = outputs["load_contact_batch"]
                 mask = torch.randint(0, outputs["points"].shape[0], (self.num_points,))
@@ -731,8 +732,6 @@ class ObjectPickDataset(PickDataset):
     def __getitem__(self, idx):
         key = self.scenes[idx]
         if self.preload_dataset:
-            from copy import deepcopy as copy
-
             if key not in self.cache:
                 # print(f"Key {key} not in cache")
                 denylist = load_from_json(self.denylist_path)
@@ -745,7 +744,7 @@ class ObjectPickDataset(PickDataset):
 
             object_grasp_data, outputs_red = self.cache[key]
 
-            outputs = copy(random.choice(outputs_red))
+            outputs = deepcopy(random.choice(outputs_red))
             mesh_mode = outputs["mesh_mode"]
             load_contact_batch = outputs["load_contact_batch"]
             mask = torch.randint(0, outputs["points"].shape[0], (self.num_points,))
