@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate direct export of a hierarchy containing native V3 reductions."""
 
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -58,3 +60,35 @@ def test_direct_encoder_export_retains_reduction_nodes(tmp_path, capacities):
         any(a.name == "plugin_version" and a.s == b"1" for a in node.attribute)
         for node in plugins
     )
+
+
+def test_encoder_export_preserves_output_name_without_gather_collision(
+    tmp_path, monkeypatch
+):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "cpp_runtime/tools"))
+    from export_ptv3_encoders import export_encoder
+
+    class Encoder(torch.nn.Module):
+        input_names = ("features",)
+
+        def example_inputs(self):
+            return (torch.randn(4, 64, dtype=torch.float16),)
+
+        def forward(self, features):
+            indices = torch.arange(4, dtype=torch.int64)
+            features = torch.nn.functional.embedding(indices, features)
+            order = indices.repeat(4, 1)
+            ptr = torch.arange(5, dtype=torch.int64)
+            count = torch.tensor([4], dtype=torch.int64)
+            for _ in range(4):
+                features = segment_max(features, order, ptr, count, 4)
+            return valid_mean(features, count)
+
+    path = tmp_path / "encoder.onnx"
+    export_encoder(Encoder().eval(), path)
+    graph = onnx.load(path)
+    onnx.checker.check_model(graph)
+    assert graph.graph.output[0].name == "embedding"
+    names = [name for node in graph.graph.node for name in node.output]
+    assert len(names) == len(set(names))
+    assert any(node.op_type == "Gather" for node in graph.graph.node)

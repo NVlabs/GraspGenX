@@ -367,12 +367,12 @@ class Ptv3EncoderGraph(nn.Module):
 
 def export_encoder(module, path):
     import onnx
+    from onnx_ir.passes.common import NameFixPass
 
     with torch.inference_mode():
-        torch.onnx.export(
+        program = torch.onnx.export(
             module,
             module.example_inputs(),
-            path,
             input_names=module.input_names,
             output_names=("embedding",),
             opset_version=18,
@@ -381,6 +381,11 @@ def export_encoder(module, path):
             optimize=True,
             verify=False,
         )
+    # F.embedding can already produce an intermediate called "embedding".
+    # Resolve collisions in the IR before serialization, retaining the public
+    # output name required by the native runtime.
+    NameFixPass()(program.model)
+    program.save(path, external_data=False)
     graph = onnx.load(path, load_external_data=False)
     onnx.checker.check_model(graph)
     if any(node.op_type == "GatherND" for node in graph.graph.node):

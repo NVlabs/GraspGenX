@@ -21,13 +21,13 @@ RUN pip install imageio python-fcl
 # Install pyrender
 RUN pip install pyrender && pip install PyOpenGL==3.1.5
 
-# Diffusion dependencies. Pin transformers to a version compatible with
-# diffusers==0.11.1 + huggingface-hub==0.25.2 (matches host uv resolution).
-# Newer transformers (>=5) drag huggingface-hub past 1.x, which breaks the
-# `from huggingface_hub import HfFolder, cached_download` imports diffusers
-# 0.11.1 still uses.
-RUN pip install diffusers==0.11.1 timm==1.0.15 huggingface-hub==0.25.2
-RUN pip install transformers==4.48.3 tensordict
+# Diffusers supplies the DDPM scheduler; Transformers is not used by GraspGenX.
+# NGC pins older versions in PIP_CONSTRAINT. Release only the model/image
+# packages being upgraded, retaining its framework and CUDA constraints.
+RUN if [ -n "${PIP_CONSTRAINT:-}" ]; then \
+        sed -i -E '/^(diffusers|huggingface[-_]hub|safetensors|pillow|filelock|onnx)([<>=!~[:space:]]|$)/Id' "$PIP_CONSTRAINT"; \
+    fi
+RUN pip install diffusers==0.38.0 timm==1.0.15 tensordict
 
 # URDF parsing (both yourdfpy and urdfpy are used by graspgenx)
 RUN pip install urdfpy yourdfpy==0.0.56
@@ -51,9 +51,12 @@ RUN cd /install/Manifold/build && cmake .. -DCMAKE_BUILD_TYPE=Release
 RUN cd /install/Manifold/build && make
 ENV PATH "${PATH}:/install/Manifold/build/"
 
-# Final defensive re-pin: any earlier RUN that pulled a transitive newer
-# huggingface-hub / diffusers gets undone here so diffusers==0.11.1 keeps
-# working.
-RUN pip install --no-deps huggingface-hub==0.25.2 diffusers==0.11.1
+# Remove unused Transformers inherited from the base image, and upgrade any
+# vulnerable image/model tooling left by the base or earlier installation steps.
+# ONNX 1.22 also needs newer protobuf, ml-dtypes and typing-extensions.
+RUN if [ -n "${PIP_CONSTRAINT:-}" ]; then \
+        sed -i -E '/^(protobuf|ml[-_]dtypes|typing[-_]extensions)([<>=!~[:space:]]|$)/Id' "$PIP_CONSTRAINT"; \
+    fi && pip uninstall -y transformers && pip install --upgrade \
+    diffusers==0.38.0 safetensors==0.8.0 onnx==1.22.0 Pillow==13.0.0 filelock==4.3.1
 
 WORKDIR /code/
