@@ -120,7 +120,11 @@ def scheduler_coefficients(
                     / beta_product
                 )
                 variance_scale = (
-                    scheduler._get_variance(timestep).sqrt()
+                    # Preserve the released fixed-small variance independently
+                    # of Diffusers' private methods and eager inference state.
+                    (beta_product_previous / beta_product * scheduler.betas[timestep])
+                    .clamp_min(1e-20)
+                    .sqrt()
                     if timestep > 0
                     else torch.zeros_like(alpha_product)
                 )

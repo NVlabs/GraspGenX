@@ -68,7 +68,7 @@ Pick **uv** for inference, **Docker** for training (Docker also does inference).
 git clone https://github.com/NVlabs/GraspGenX.git && cd GraspGenX && uv sync
 ```
 
-Python >= 3.10. `pip install -e .` also works inside a conda or venv. Add the
+Python >= 3.11. `pip install -e .` also works inside a conda or venv. Add the
 `fast-inference` extra only for the native C++ runtime.
 
 **Optional extras** (add only what you need):
@@ -229,7 +229,7 @@ LLM  ──MCP (stdio)──▶  mcp/ bridge  ──ZMQ (tcp)──▶  GraspGen
 Install and register:
 
 ```bash
-cd mcp && uv venv --python 3.10 .venv && source .venv/bin/activate && uv pip install -e .
+cd mcp && uv venv --python 3.11 .venv && source .venv/bin/activate && uv pip install -e .
 ```
 
 Tools exposed: `generate_grasps_from_mesh`, `generate_grasps_from_point_cloud`,

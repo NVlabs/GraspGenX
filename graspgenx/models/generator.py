@@ -36,6 +36,19 @@ from graspgenx.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def _set_inference_timesteps(scheduler, num_inference_steps):
+    """Preserve the released adjacent-step DDPM updates on a thinned eval grid."""
+    if num_inference_steps <= 0:
+        raise ValueError("num_inference_steps must be positive")
+    train_steps = scheduler.config.num_train_timesteps
+    # Diffusers now steps between entries in scheduler.timesteps. Keep its
+    # transition grid complete and thin only the model's evaluation grid, as
+    # Diffusers 0.11.1 did, including non-divisible and oversized requests.
+    scheduler.set_timesteps(train_steps)
+    step_ratio = train_steps // min(train_steps, num_inference_steps)
+    return scheduler.timesteps.flip(0)[::step_ratio].flip(0)
+
+
 class GraspGenGenerator(nn.Module):
     """GraspGen generator model for generating 6-DOF robotic grasps.
 
@@ -790,12 +803,16 @@ class GraspGenGenerator(nn.Module):
             obs_embedding = torch.concat([object_embedding, gripper_embedding], dim=-1)
 
             if self.compositional_schedular:
-                self.noise_scheduler_pos.set_timesteps(self.num_diffusion_iters_eval)
-                timesteps = self.noise_scheduler_pos.timesteps
-                self.noise_scheduler_rot.set_timesteps(self.num_diffusion_iters_eval)
+                timesteps = _set_inference_timesteps(
+                    self.noise_scheduler_pos, self.num_diffusion_iters_eval
+                )
+                _set_inference_timesteps(
+                    self.noise_scheduler_rot, self.num_diffusion_iters_eval
+                )
             else:
-                self.noise_scheduler.set_timesteps(self.num_diffusion_iters_eval)
-                timesteps = self.noise_scheduler.timesteps
+                timesteps = _set_inference_timesteps(
+                    self.noise_scheduler, self.num_diffusion_iters_eval
+                )
 
             for k in timesteps:
                 samples = noisy_grasps if self.pose_repr == "mlp" else None

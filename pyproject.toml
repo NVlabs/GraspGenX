@@ -14,11 +14,11 @@ maintainers = [
 ]
 license = {text = "NVIDIA Corporation"}
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["robotics", "manipulation", "learning", "computer-vision", "grasping", "cross-embodiment"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Natural Language :: English",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -35,8 +35,10 @@ dependencies = [
     "numpy==1.26.4",
     "scipy",
     "trimesh==4.5.3",
-    "diffusers==0.11.1",
-    "huggingface-hub==0.25.2",
+    "diffusers>=0.38.0",
+    # Security floors for dependencies also pulled in by Diffusers and PyTorch.
+    "Pillow>=13.0.0",
+    "filelock>=4.2.1",
     "addict",
     "tqdm",
     "pyyaml",
@@ -71,7 +73,7 @@ fast-inference = [
     "tensorrt-cu13-bindings==10.13.3.9; platform_machine != 'aarch64'",
     "tensorrt-cu13-libs==10.13.3.9; platform_machine != 'aarch64'",
     "ml-dtypes==0.5.4; python_version < '3.13'",
-    "onnx==1.21.0; python_version < '3.13'",
+    "onnx>=1.22.0; python_version < '3.13'",
     "onnxscript==0.7.1; python_version < '3.13'",
 ]
 # Dataset and training utilities. The released PTV3 inference path does not
@@ -132,6 +134,8 @@ serve = [
 ]
 
 [tool.uv]
+# NumPy 1.26.4 supports the Python 3.11-3.12 development environments.
+environments = ["python_version < '3.13'"]
 # TensorRT's cu13 library wheels retain a dependency on NVIDIA's retired
 # placeholder package. PyTorch's nvidia-cuda-runtime package supplies libcudart.
 exclude-dependencies = [
@@ -168,7 +172,7 @@ markers = [
 
 [tool.black]
 line-length = 88
-target-version = ['py310']
+target-version = ['py311']
 
 [tool.isort]
 profile = "black"

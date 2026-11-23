@@ -68,8 +68,11 @@ Choose your preferred installation method. For training, we recommend **Docker**
 
 ### Installation with uv
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/). Eager
-PyTorch inference is the base install:
+Python 3.11 or newer is required. Install
+[uv](https://docs.astral.sh/uv/getting-started/installation/). Use Python 3.11 or
+3.12 for the full development environment; the NumPy 1.26.4 pin prevents an
+all-extras resolution on Python 3.13 or newer. Eager PyTorch inference is the
+base install:
 
 ```bash
 git clone https://github.com/NVlabs/GraspGenX.git && cd GraspGenX
