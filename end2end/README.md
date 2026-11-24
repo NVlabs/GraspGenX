@@ -10,8 +10,8 @@ collision-free arm trajectory to a collision-free grasp → **Newton/MuJoCo**
 replays the trajectory under gravity + contacts (PD-controlled joints) →
 renders an **MP4** and exports a **USD** animation.
 
-Three example demos ship out of the box (a Franka Panda, plus a UR10e +
-arx_x5); see [The three demos](#the-three-demos).
+Four example demos ship out of the box (a Franka Panda, plus a UR10e with
+an arx_x5 or a Robotiq 2F-140); see [The demos](#the-demos).
 
 <img src="../assets/gifs/clutter_removal.gif" width="180" height="135" title="readme1"> <img src="../assets/gifs/unitree.gif" width="153" height="135" title="readme3"> <img src="../assets/gifs/surge.gif" width="153" height="135" title="readme4"> <img src="../assets/gifs/battery_removal.gif" width="180" height="135" title="readme5">
 
@@ -24,17 +24,22 @@ inference install. It lives in an optional extra:
 
 ```bash
 uv sync --extra end2end    # + cuRobo, Newton
-python end2end/setup_end2end_deps.py   # cuRobo assets into ext/ + UR10e arx_x5 URDF
+python end2end/setup_end2end_deps.py   # cuRobo assets into ext/ + UR10e robot URDFs
 ```
 
 `setup_end2end_deps.py` clones the full cuRobo source (with its git-LFS robot
 meshes) into `ext/curobo`, re-installs cuRobo editable from it, and builds the
-merged UR10e + arx_x5 URDF that example 3 needs (a gitignored artifact under
-`end2end/curobo_assets/`). It's idempotent — re-run it any time.
+merged UR10e + arx_x5 and UR10e + Robotiq 2F-140 URDFs that examples 3 and 4
+need (gitignored artifacts under `end2end/curobo_assets/`). It's idempotent —
+re-run it any time.
+
+> If a UR10e build fails with "Collision mesh … has no vertices", the
+> `gripper_descriptions` checkout is missing its git-LFS meshes (they are
+> pointer files). Run `git lfs pull` inside it, then re-run the setup script.
 
 ---
 
-## The three demos
+## The demos
 
 Run every command **from the repo root** (the env YAMLs use repo-relative
 mesh paths). Each writes a `trajectory.json` you then render / export
@@ -45,6 +50,7 @@ mesh paths). Each writes a `trajectory.json` you then render / export
 | 1 | Franka — single pick → bin | `robots/franka_panda.yaml` | `envs/single_bin_demo.yaml` | `clutter_pick_and_drop` |
 | 2 | Franka — 3-object clutter → bin | `robots/franka_panda.yaml` | `envs/franka_clutter3_demo.yaml` | `clutter_pick_and_drop` |
 | 3 | UR10e + arx_x5 — pick & lift | `robots/ur10e_arx_x5.yaml` | `envs/tabletop_single_nobin.yaml` | `pick_and_lift` |
+| 4 | UR10e + Robotiq 2F-140 — pick & lift (default) | `robots/ur10e_robotiq_2f_140.yaml` | `envs/tabletop_single_nobin.yaml` | `pick_and_lift` |
 
 **1 — Franka, single object → bin** (ChocolatePudding):
 
@@ -81,6 +87,27 @@ PYOPENGL_PLATFORM=egl PYGLET_HEADLESS=true uv run python end2end/e2e_grasp_demo.
   --hold_after_close_frames 150 --seed 0 \
   --export-trajectory end2end/runs/arx_lift/trajectory.json
 ```
+
+**4 — UR10e + Robotiq 2F-140, pick & lift** (the script's defaults, so the
+robot, env and mesh flags can be omitted):
+
+```bash
+PYOPENGL_PLATFORM=egl PYGLET_HEADLESS=true uv run python end2end/e2e_grasp_demo.py \
+  --robot_config end2end/robots/ur10e_robotiq_2f_140.yaml \
+  --env_config   end2end/envs/tabletop_single_nobin.yaml \
+  --mesh_file    assets/sample_data/hope_objects/GranolaBars.obj \
+  --task pick_and_lift --playback_mode dynamic --no-viser \
+  --num_grasps 200 --topk 80 --grasp_threshold 0.7 --planner graspmoe \
+  --hold_after_close_frames 150 --seed 0 \
+  --export-trajectory end2end/runs/robotiq_lift/trajectory.json
+```
+
+The Robotiq is mounted on `tool0` with an identity transform, and its
+`grasp_to_tool_transform` is a 1.57 rad rotation about Z. That matches the
+`world_joint` in the `gripper_descriptions` URDF and keeps the jaws closing
+along the GraspGenX grasp X axis.
+`tests/test_end2end_robot_configs.py` checks this alignment without a
+simulator.
 
 ---
 
@@ -183,9 +210,9 @@ the real pipeline and checks the outcome from the trajectory (no rendering):
 uv run pytest tests/test_end2end_demos.py -m end2end -v -s
 ```
 
-These are slow GPU integration tests. The UR10e case skips with a hint if the
-merged URDF does not exist yet — re-run `python end2end/setup_end2end_deps.py`
-(it builds it).
+These are slow GPU integration tests. The UR10e cases skip with a hint if the
+merged URDFs do not exist yet — re-run `python end2end/setup_end2end_deps.py`
+(it builds them).
 
 ---
 

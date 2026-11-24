@@ -51,7 +51,14 @@ import trimesh.transformations as tra
 import warp as wp
 import yourdfpy
 
-import newton
+# newton 1.0.0 reads ``wp.config.verbose`` at import time, which warp-lang 1.19
+# no longer defines. cuRobo sets it as a side effect of its own init, so the
+# import only worked when cuRobo was loaded first; set it here so the import
+# doesn't depend on import order.
+if not hasattr(wp.config, "verbose"):
+    wp.config.verbose = False
+
+import newton  # noqa: E402
 
 from robot_profiles import RobotProfile
 from scene_builder import SceneBundle

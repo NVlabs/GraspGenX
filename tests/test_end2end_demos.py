@@ -7,13 +7,14 @@ Runs each of the four featured ``end2end/`` demos through the real pipeline
   1. franka_single   Franka Panda picks one HOPE object → bin.
   2. franka_clutter3 Franka Panda clears a 3-object HOPE scene → bin.
   3. arx_lift        UR10e + arx_x5 grasps + lifts one object (no bin).
+  4. robotiq_lift    UR10e + Robotiq 2F-140 grasps + lifts one object (no bin).
 
 These are slow GPU integration tests (model load + sim per demo). Run with::
 
     uv run pytest tests/test_end2end_demos.py -m end2end -v -s
 
-The UR10e demos need the merged robot URDF, generated once into the
-gitignored ``end2end/curobo_assets/`` by ``build_ur10e_gripper.py``; if it's
+The UR10e demos need the merged robot URDFs, generated once into the
+gitignored ``end2end/curobo_assets/`` by ``setup_end2end_deps.py``; if they're
 missing the UR10e cases skip with a hint instead of failing.
 """
 from __future__ import annotations
@@ -61,6 +62,14 @@ DEMOS = {
         extra_args=["--hold_after_close_frames", "150"],
         outcome="lift", min_in_bin=0, n_objects=1,
     ),
+    "robotiq_lift": dict(
+        robot="ur10e_robotiq_2f_140.yaml",
+        env="tabletop_single_nobin.yaml",
+        task="pick_and_lift",
+        mesh=str(HOPE / "GranolaBars.obj"),
+        extra_args=["--hold_after_close_frames", "150"],
+        outcome="lift", min_in_bin=0, n_objects=1,
+    ),
 }
 
 # Bin footprint half-extent (+ margin) used to decide "landed in the bin".
@@ -72,6 +81,13 @@ _LIFT_RISE = 0.05
 def _curobo_available() -> bool:
     try:
         import curobo  # noqa: F401
+        import warp as wp
+
+        # Same workaround as end2end/dynamic_playback.py: newton reads
+        # wp.config.verbose, which newer warp-lang no longer defines; without
+        # it this check failed and every case here was silently skipped.
+        if not hasattr(wp.config, "verbose"):
+            wp.config.verbose = False
         import newton  # noqa: F401
         return True
     except Exception:
@@ -153,16 +169,15 @@ def _run_demo(spec: dict, traj_path: Path) -> None:
 def test_end2end_demo(name, tmp_path):
     spec = DEMOS[name]
 
-    # UR10e demos need the generated merged URDF (gitignored). Skip with a
-    # hint on a fresh checkout where it hasn't been built yet.
+    # UR10e demos need the generated merged URDF + cuRobo YAML (gitignored).
+    # Skip with a hint on a fresh checkout where they haven't been built yet.
     if spec["robot"].startswith("ur10e"):
         stem = spec["robot"].replace(".yaml", "")
-        merged = E2E / "curobo_assets" / f"{stem}.urdf"
-        if not merged.is_file():
+        merged = [E2E / "curobo_assets" / f"{stem}{ext}" for ext in (".urdf", ".yml")]
+        if not all(p.is_file() for p in merged):
             pytest.skip(
-                f"{merged.name} missing — run "
-                f"`python end2end/build_ur10e_gripper.py --gripper "
-                f"{stem.replace('ur10e_', '')}` first."
+                f"{stem} robot assets missing — run "
+                "`python end2end/setup_end2end_deps.py` first."
             )
 
     traj = tmp_path / "trajectory.json"

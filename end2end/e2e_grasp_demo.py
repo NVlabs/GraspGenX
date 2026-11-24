@@ -11,13 +11,13 @@ Pipeline:
   7. Animate the trajectory in viser
   8. Export trajectory.json (always) and optionally encode an MP4
 
-Run:
-  cd GraspGen/end2end
-  uv run python e2e_grasp_demo.py \
-      --robot_config robots/ur5e_robotiq_2f_140.yaml \
-      --env_config   envs/tabletop.yaml \
-      --mesh_file    ../assets/objects/banana.obj \
-      --render-mp4   runs/demo.mp4
+Run (from the repo root; with no arguments this is a UR10e + Robotiq 2F-140
+pick-and-lift of a HOPE object on a bare tabletop):
+  uv run --no-sync python end2end/e2e_grasp_demo.py \
+      --robot_config end2end/robots/ur10e_robotiq_2f_140.yaml \
+      --env_config   end2end/envs/tabletop_single_nobin.yaml \
+      --mesh_file    assets/sample_data/hope_objects/GranolaBars.obj \
+      --render-mp4   end2end/runs/demo.mp4
 """
 
 from __future__ import annotations
@@ -68,17 +68,21 @@ log = logging.getLogger("e2e")
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="End-to-end grasping demo")
     ap.add_argument(
-        "--robot_config", type=Path, default=_HERE / "robots/ur5e_robotiq_2f_140.yaml"
+        "--robot_config",
+        type=Path,
+        default=_HERE / "robots/ur10e_robotiq_2f_140.yaml",
     )
-    ap.add_argument("--env_config", type=Path, default=_HERE / "envs/tabletop.yaml")
+    ap.add_argument(
+        "--env_config", type=Path, default=_HERE / "envs/tabletop_single_nobin.yaml"
+    )
     ap.add_argument(
         "--mesh_file",
         type=Path,
-        default=None,
-        help="Path to the manipulation-target mesh (.obj/.stl/.ply). "
-        "Required for single-object tasks; optional (and ignored) "
-        "for clutter_pick_and_drop where the env YAML's object_slots "
-        "carry mesh paths per object.",
+        default=_HERE.parent / "assets/sample_data/hope_objects/GranolaBars.obj",
+        help="Path to the manipulation-target mesh (.obj/.stl/.ply) for "
+        "single-object tasks (default: the HOPE GranolaBars sample). "
+        "Ignored for clutter_pick_and_drop, where the env YAML's "
+        "object_slots carry mesh paths per object.",
     )
     ap.add_argument("--mesh_scale", type=float, default=1.0)
     ap.add_argument(
@@ -154,7 +158,7 @@ def parse_args() -> argparse.Namespace:
         "sequence runs. See end2end/tasks.py. Default "
         "pick_and_lift = original approach+grasp+close+lift. "
         "pick_and_drop_in_bin adds transport+drop+release "
-        "(use with envs/tabletop_bin.yaml).",
+        "(use with an env YAML that defines a `bin` asset).",
     )
     ap.add_argument(
         "--rank_grasps_by_confidence",

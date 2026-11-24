@@ -412,11 +412,12 @@ PYOPENGL_PLATFORM=egl PYGLET_HEADLESS=true uv run python end2end/e2e_grasp_demo.
   --seed 0 --export-trajectory end2end/runs/franka_single/trajectory.json
 ```
 
-Three demos ship: Franka single-object → bin (above), Franka 3-object clutter →
+Four demos ship: Franka single-object → bin (above), Franka 3-object clutter →
 bin (`envs/franka_clutter3_demo.yaml`, add `--max_retries_per_object 2`), and
-UR10e + arx_x5 pick-and-lift (`robots/ur10e_arx_x5.yaml` +
-`envs/tabletop_single_nobin.yaml`, add `--mesh_file … --hold_after_close_frames
-150`). Each writes a `trajectory.json`; render it decoupled from the sim:
+UR10e pick-and-lift with an arx_x5 (`robots/ur10e_arx_x5.yaml`) or a Robotiq
+2F-140 (`robots/ur10e_robotiq_2f_140.yaml`, the script default), both on
+`envs/tabletop_single_nobin.yaml` with `--mesh_file … --hold_after_close_frames
+150`. Each writes a `trajectory.json`; render it decoupled from the sim:
 
 ```bash
 PYOPENGL_PLATFORM=egl uv run python end2end/render_trajectory_mp4.py \

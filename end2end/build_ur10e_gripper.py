@@ -26,6 +26,8 @@ visualize_robot_curobo_spheres.py.
 
 Run::
   uv run python end2end/build_ur10e_gripper.py --gripper surge_hand
+  uv run python end2end/build_ur10e_gripper.py --gripper robotiq_2f_140 \
+      --mount_rpy 0 0 0
 """
 
 from __future__ import annotations
@@ -249,6 +251,14 @@ def _link_collision_mesh(link):
                 continue
         if piece is None:
             continue
+        if len(piece.vertices) == 0:
+            raise RuntimeError(
+                f"Collision mesh for link {link.name!r} has no vertices"
+                + (f" ({g.mesh.filename})" if getattr(g, "mesh", None) else "")
+                + ". If gripper_descriptions was cloned without its git-LFS "
+                "objects the mesh is a pointer file; run `git lfs pull` in "
+                "the gripper_descriptions checkout."
+            )
         piece.apply_transform(origin)
         pieces.append(piece)
     import trimesh as _t
