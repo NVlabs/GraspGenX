@@ -135,8 +135,68 @@ def load_urdf(urdf_path: str) -> yourdfpy.URDF:
 
 
 def get_joint_names(robot: yourdfpy.URDF) -> List[str]:
-    """Return actuated (non-fixed) joint names."""
-    return [j.name for j in robot.robot.joints if j.type != "fixed"]
+    """Return actuated joint names (non-fixed and not mimic).
+
+    Mimic joints are driven by their master joint: yourdfpy recomputes them
+    on every ``update_cfg`` call, so they must not get their own sliders or
+    entries in the saved open/close joint states.
+    """
+    return list(robot.actuated_joint_names)
+
+
+def _top_level_moving_joints(robot: yourdfpy.URDF, include_mimic: bool) -> List[str]:
+    """Moving joints that have no moving joint between them and the root.
+
+    Each such joint starts an independent kinematic branch off the palm,
+    i.e. roughly one finger (or one side of a linkage).
+    """
+    joints = [j for j in robot.robot.joints if j.type != "fixed"]
+    if not include_mimic:
+        joints = [j for j in joints if j.mimic is None]
+    moving = {j.name for j in joints}
+    parent_joint = {j.child: j for j in robot.robot.joints}
+
+    top_level = []
+    for j in joints:
+        link = j.parent
+        has_moving_ancestor = False
+        while link in parent_joint:
+            ancestor = parent_joint[link]
+            if ancestor.name in moving:
+                has_moving_ancestor = True
+                break
+            link = ancestor.parent
+        if not has_moving_ancestor:
+            top_level.append(j.name)
+    return top_level
+
+
+def infer_gripper_type(robot: yourdfpy.URDF) -> Tuple[str, bool]:
+    """Infer the GraspGenX gripper type and symmetry from the URDF kinematics.
+
+    Returns:
+        (gripper_type, symmetric), where gripper_type is one of
+        "parallel_2f", "revolute_2f" or "revolute_3f". The result is only the
+        initial value of the Step 6 dropdown/checkbox; users can override it.
+    """
+    actuated = [robot.joint_map[n] for n in robot.actuated_joint_names]
+    if not actuated:
+        return "parallel_2f", True
+
+    if all(j.type == "prismatic" for j in actuated):
+        gtype = "parallel_2f"
+    elif len(_top_level_moving_joints(robot, include_mimic=False)) <= 2:
+        gtype = "revolute_2f"
+    else:
+        gtype = "revolute_3f"
+
+    # Two-finger grippers are symmetric when both jaws move (e.g. via a mimic
+    # joint); a single moving jaw against a fixed one (e.g. Spot) is not.
+    symmetric = (
+        gtype != "revolute_3f"
+        and len(_top_level_moving_joints(robot, include_mimic=True)) >= 2
+    )
+    return gtype, symmetric
 
 
 def get_link_names(robot: yourdfpy.URDF) -> List[str]:
@@ -1275,14 +1335,7 @@ class ConfigWizard:
             self.robot, self.open_js, base_T=self.base_rotation
         )
 
-        # Infer gripper type
-        num_actuated = len(self.joint_names)
-        if num_actuated <= 2:
-            gtype = "parallel_2f"
-        elif num_actuated <= 4:
-            gtype = "revolute_2f"
-        else:
-            gtype = "revolute_3f"
+        gtype, symmetric = infer_gripper_type(self.robot)
 
         config = {
             "open": self.open_js,
@@ -1296,7 +1349,7 @@ class ConfigWizard:
             },
             "links": self.link_names,
             "standoff": [0.0, self.sv_extents[2] / 2],
-            "symmetric": True,
+            "symmetric": symmetric,
             "type": gtype,
             "bbox": [bbox_min, bbox_max],
             "base_rotation": self.base_rotation.tolist(),
@@ -1318,7 +1371,7 @@ class ConfigWizard:
         )
         self._gui_handles.append(type_dropdown)
 
-        symmetric_cb = self.vis.gui.add_checkbox("Symmetric", initial_value=True)
+        symmetric_cb = self.vis.gui.add_checkbox("Symmetric", initial_value=symmetric)
         self._gui_handles.append(symmetric_cb)
 
         btn = self.vis.gui.add_button("Confirm and Save Config", color="green")
